@@ -36,6 +36,7 @@ from label_ocr_service import (
 )
 from meesho_service import process_uploaded_paths as process_meesho_uploaded_paths
 from return_analysis_service import analyze_returns_against_orders
+from runtime_io import make_temp_dir, worker_temp_usage_snapshot
 
 logger = logging.getLogger("labelhub.tasks")
 T = TypeVar("T")
@@ -70,6 +71,9 @@ _s3_store_singleton = None
 _queue_metrics_cache: dict[str, object] = {"ts": 0.0, "payload": None}
 _redis_requeue_scan_state: dict[str, float] = {"ts": 0.0}
 _progress_update_cache: dict[str, dict[str, object]] = {}
+_redis_local_sync_cache: dict[str, dict[str, object]] = {}
+_redis_inflight_repair_state: dict[str, float] = {"ts": 0.0}
+_worker_runtime_sample_cache: dict[str, float] = {}
 OCR_MASTER_DIR = (Path(DB_PATH).resolve().parent / "ocr_store").resolve()
 RISK_STORE_DIR = (Path(DB_PATH).resolve().parent / "risk_store").resolve()
 RISK_ACTIVATION_SCORE = float(os.getenv("RISK_ACTIVATION_SCORE", "8"))
@@ -121,11 +125,16 @@ def _needs_global_finalizer_pass(task_type: object, sort_by: object) -> bool:
     normalized_sort_by = _normalize_sort_by(sort_by)
     if normalized_task_type in {"crop_flipkart", "crop_flipkart_chunk"}:
         return True
+    # Meesho sort modes that depend on whole-document ordering must re-run the
+    # finalizer pass after fan-out chunks complete. ``payment_method`` joins
+    # this set because COD/Prepaid grouping only makes sense across the merged
+    # output, not per-chunk.
     return normalized_task_type in {"crop_meesho", "crop_meesho_chunk"} and normalized_sort_by in {
         "sku",
         "delivery",
         "size",
         "color",
+        "payment_method",
     }
 
 
@@ -150,12 +159,399 @@ def _redis_queue_name() -> str:
     return os.getenv("REDIS_QUEUE_NAME", "labelhub:tasks").strip() or "labelhub:tasks"
 
 
+def _redis_queue_name_for_class(queue_class: object | None) -> str:
+    base = _redis_queue_name()
+    cls = str(queue_class or "").strip().lower()
+    if cls == "bulk":
+        return f"{base}:bulk"
+    if cls in {"priority", "premium"}:
+        return f"{base}:priority"
+    return base
+
+
+def _redis_queue_names_for_worker_role(worker_role: object | None) -> list[str]:
+    """Queue pull order by worker role.
+
+    - realtime workers: premium-priority first, then regular realtime.
+    - bulk workers: historical/bulk OCR queue only.
+    - all workers (default): priority -> realtime -> bulk.
+    """
+    role = str(worker_role or "all").strip().lower()
+    if role == "bulk":
+        names = [_redis_queue_name_for_class("bulk")]
+    elif role == "realtime":
+        names = [_redis_queue_name_for_class("priority"), _redis_queue_name_for_class("realtime")]
+    else:
+        names = [
+            _redis_queue_name_for_class("priority"),
+            _redis_queue_name_for_class("realtime"),
+            _redis_queue_name_for_class("bulk"),
+        ]
+    # Preserve order while deduplicating.
+    out: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        if name and name not in seen:
+            out.append(name)
+            seen.add(name)
+    return out
+
+
 def _redis_task_key(task_id: str) -> str:
     return f"{_redis_queue_name()}:task:{task_id}"
 
 
 def _redis_user_tasks_key(user_id: int) -> str:
     return f"{_redis_queue_name()}:user:{int(user_id)}:tasks"
+
+
+def _redis_metrics_key() -> str:
+    return f"{_redis_queue_name()}:metrics"
+
+
+def _redis_worker_activity_key(role: str = "all") -> str:
+    safe_role = (str(role or "all").strip().lower() or "all")
+    return f"{_redis_queue_name()}:workers:active:{safe_role}"
+
+
+def _redis_failed_events_key() -> str:
+    return f"{_redis_queue_name()}:failed_events"
+
+
+def _safe_iso_to_epoch(iso_ts: object) -> float:
+    text = str(iso_ts or "").strip()
+    if not text:
+        return 0.0
+    try:
+        stamp = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        return float(stamp.timestamp())
+    except Exception:
+        return 0.0
+
+
+def _redis_observe_metric_ms(name: str, elapsed_ms: float) -> None:
+    if not _use_redis_queue():
+        return
+    key = str(name or "").strip().lower()
+    if not key:
+        return
+    ms = max(0.0, float(elapsed_ms or 0.0))
+    try:
+        pipe = _redis_client().pipeline(transaction=False)
+        pipe.hincrby(_redis_metrics_key(), f"{key}_count", 1)
+        pipe.hincrby(_redis_metrics_key(), f"{key}_ms_total", int(ms))
+        pipe.hset(_redis_metrics_key(), f"{key}_ms_last", int(ms))
+        pipe.execute()
+    except Exception:
+        pass
+
+
+def _redis_observe_runtime_histogram(name: str, elapsed_ms: float) -> None:
+    if not _use_redis_queue():
+        return
+    base = str(name or "").strip().lower()
+    if not base:
+        return
+    ms = max(0.0, float(elapsed_ms or 0.0))
+    bucket = "gt_60s"
+    for cap, label in (
+        (250, "le_250ms"),
+        (1000, "le_1s"),
+        (5000, "le_5s"),
+        (15000, "le_15s"),
+        (60000, "le_60s"),
+    ):
+        if ms <= cap:
+            bucket = label
+            break
+    try:
+        pipe = _redis_client().pipeline(transaction=False)
+        pipe.hincrby(_redis_metrics_key(), f"{base}_count", 1)
+        pipe.hincrby(_redis_metrics_key(), f"{base}_ms_total", int(ms))
+        pipe.hset(_redis_metrics_key(), f"{base}_ms_last", int(ms))
+        pipe.hincrby(_redis_metrics_key(), f"{base}_{bucket}", 1)
+        pipe.execute()
+    except Exception:
+        pass
+
+
+def _process_rss_kb() -> int:
+    try:
+        import resource  # type: ignore
+
+        rss = int(getattr(resource.getrusage(resource.RUSAGE_SELF), "ru_maxrss", 0) or 0)
+        # Linux reports KB; macOS reports bytes. Normalize to KB.
+        if rss > (1024 * 1024 * 16):
+            rss = int(rss / 1024)
+        return max(0, int(rss))
+    except Exception:
+        return 0
+
+
+def _redis_record_worker_runtime_sample(worker_id: str, *, worker_role: str = "all", force: bool = False) -> None:
+    if not _use_redis_queue():
+        return
+    wid = str(worker_id or "").strip()
+    if not wid:
+        return
+    now_ts = time.time()
+    min_interval = max(5.0, float(os.getenv("WORKER_RUNTIME_METRICS_INTERVAL_SEC", "30") or 30))
+    last = float(_worker_runtime_sample_cache.get(wid) or 0.0)
+    if not force and (now_ts - last) < min_interval:
+        return
+    _worker_runtime_sample_cache[wid] = now_ts
+    role = (str(worker_role or "all").strip().lower() or "all")
+    if role not in {"all", "realtime", "bulk"}:
+        role = "all"
+    temp = worker_temp_usage_snapshot()
+    try:
+        pipe = _redis_client().pipeline(transaction=False)
+        worker_key = f"{_redis_queue_name()}:worker:stats:{wid}"
+        pipe.hset(
+            worker_key,
+            mapping={
+                "worker_id": wid,
+                "role": role,
+                "rss_kb": int(_process_rss_kb()),
+                "ts": int(now_ts),
+                "temp_fs_used_bytes": int(temp.get("temp_fs_used_bytes") or 0),
+                "temp_fs_free_bytes": int(temp.get("temp_fs_free_bytes") or 0),
+                "temp_fs_total_bytes": int(temp.get("temp_fs_total_bytes") or 0),
+                "temp_entry_count": int(temp.get("temp_entry_count") or 0),
+            },
+        )
+        pipe.expire(worker_key, max(60, int(min_interval * 4)))
+        pipe.hset(_redis_metrics_key(), "worker_rss_kb_last", int(_process_rss_kb()))
+        pipe.hset(_redis_metrics_key(), "temp_fs_used_bytes_last", int(temp.get("temp_fs_used_bytes") or 0))
+        pipe.hset(_redis_metrics_key(), "temp_entry_count_last", int(temp.get("temp_entry_count") or 0))
+        pipe.execute()
+    except Exception:
+        pass
+
+
+def record_worker_soft_failure(worker_id: str, *, error_name: str, transient: bool) -> None:
+    if not _use_redis_queue():
+        return
+    kind = "transient" if transient else "unexpected"
+    err = str(error_name or "UnknownError").strip()[:64] or "UnknownError"
+    try:
+        pipe = _redis_client().pipeline(transaction=False)
+        pipe.hincrby(_redis_metrics_key(), "worker_soft_failures_total", 1)
+        pipe.hincrby(_redis_metrics_key(), f"worker_soft_failures_{kind}", 1)
+        pipe.hincrby(_redis_metrics_key(), f"worker_soft_failure_err_{err}", 1)
+        pipe.hset(_redis_metrics_key(), "worker_soft_failure_last_at", _utc_now_iso())
+        pipe.hset(_redis_metrics_key(), "worker_soft_failure_last_worker", str(worker_id or "")[:80])
+        pipe.execute()
+    except Exception:
+        pass
+
+
+def _redis_inflight_queue_name(queue_name: str) -> str:
+    return f"{queue_name}:inflight"
+
+
+def _redis_inflight_index_key() -> str:
+    return f"{_redis_queue_name()}:inflight:index"
+
+
+def _queue_class_from_queue_name(queue_name: str) -> str:
+    qn = str(queue_name or "").strip()
+    if qn.endswith(":priority"):
+        return "priority"
+    if qn.endswith(":bulk"):
+        return "bulk"
+    return "realtime"
+
+
+def _redis_queue_counter_fields(queue_class: object | None) -> tuple[str, str]:
+    cls = str(queue_class or "").strip().lower()
+    if cls == "priority":
+        return "queued", "queued_priority"
+    if cls == "bulk":
+        return "queued", "queued_bulk"
+    return "queued", "queued_realtime"
+
+
+def _redis_state_counter_field(status: object | None) -> str:
+    s = str(status or "").strip().lower()
+    if s not in TASK_STATUSES:
+        return ""
+    return f"state_{s}"
+
+
+def _redis_adjust_state_counters(*, from_status: object | None = None, to_status: object | None = None) -> None:
+    if not _use_redis_queue():
+        return
+    from_field = _redis_state_counter_field(from_status)
+    to_field = _redis_state_counter_field(to_status)
+    updates: dict[str, int] = {}
+    if from_field and from_field != to_field:
+        updates[from_field] = int(updates.get(from_field, 0) - 1)
+    if to_field and to_field != from_field:
+        updates[to_field] = int(updates.get(to_field, 0) + 1)
+    if not updates:
+        return
+    now_ts = time.time()
+    try:
+        pipe = _redis_client().pipeline(transaction=False)
+        for field, delta in updates.items():
+            pipe.hincrby(_redis_metrics_key(), field, int(delta))
+        # Track failure events with rolling-24h zset so metrics avoid SCAN.
+        if to_field == "state_failed":
+            event_id = f"{int(now_ts * 1000)}:{uuid.uuid4().hex[:8]}"
+            pipe.zadd(_redis_failed_events_key(), {event_id: now_ts})
+            pipe.zremrangebyscore(_redis_failed_events_key(), "-inf", now_ts - 86400)
+        pipe.execute()
+    except Exception:
+        pass
+
+
+def _redis_record_worker_heartbeat(worker_id: str, *, worker_role: str = "all") -> None:
+    if not _use_redis_queue():
+        return
+    wid = str(worker_id or "").strip()
+    if not wid:
+        return
+    role = (str(worker_role or "all").strip().lower() or "all")
+    if role not in {"all", "realtime", "bulk"}:
+        role = "all"
+    now_ts = time.time()
+    ttl_sec = max(10, int(os.getenv("REDIS_ACTIVE_WORKER_TTL_SEC", "90") or 90))
+    cutoff = now_ts - float(ttl_sec)
+    start_perf = time.perf_counter()
+    try:
+        pipe = _redis_client().pipeline(transaction=False)
+        pipe.zadd(_redis_worker_activity_key("all"), {wid: now_ts})
+        pipe.zadd(_redis_worker_activity_key(role), {wid: now_ts})
+        pipe.zremrangebyscore(_redis_worker_activity_key("all"), "-inf", cutoff)
+        pipe.zremrangebyscore(_redis_worker_activity_key(role), "-inf", cutoff)
+        pipe.execute()
+        _redis_record_worker_runtime_sample(wid, worker_role=role, force=False)
+    except Exception:
+        pass
+    finally:
+        _redis_observe_metric_ms("redis_worker_heartbeat", (time.perf_counter() - start_perf) * 1000.0)
+
+
+def _redis_active_worker_counts() -> dict[str, int]:
+    if not _use_redis_queue():
+        return {"active_workers": 0, "active_workers_realtime": 0, "active_workers_bulk": 0}
+    ttl_sec = max(10, int(os.getenv("REDIS_ACTIVE_WORKER_TTL_SEC", "90") or 90))
+    cutoff = time.time() - float(ttl_sec)
+    try:
+        client = _redis_client()
+        pipe = client.pipeline(transaction=False)
+        for role in ("all", "realtime", "bulk"):
+            pipe.zremrangebyscore(_redis_worker_activity_key(role), "-inf", cutoff)
+        pipe.execute()
+        active_all = int(client.zcard(_redis_worker_activity_key("all")) or 0)
+        active_rt = int(client.zcard(_redis_worker_activity_key("realtime")) or 0)
+        active_bulk = int(client.zcard(_redis_worker_activity_key("bulk")) or 0)
+        return {
+            "active_workers": max(0, active_all),
+            "active_workers_realtime": max(0, active_rt),
+            "active_workers_bulk": max(0, active_bulk),
+        }
+    except Exception:
+        return {"active_workers": 0, "active_workers_realtime": 0, "active_workers_bulk": 0}
+
+
+def _redis_adjust_queue_counters(*, queue_class: object | None = None, queued_delta: int = 0, running_delta: int = 0) -> None:
+    if not _use_redis_queue():
+        return
+    q_total, q_class = _redis_queue_counter_fields(queue_class)
+    updates: dict[str, int] = {}
+    if int(queued_delta):
+        updates[q_total] = int(updates.get(q_total, 0) + int(queued_delta))
+        updates[q_class] = int(updates.get(q_class, 0) + int(queued_delta))
+    if int(running_delta):
+        updates["running"] = int(updates.get("running", 0) + int(running_delta))
+    if not updates:
+        return
+    start_perf = time.perf_counter()
+    try:
+        pipe = _redis_client().pipeline(transaction=False)
+        for field, delta in updates.items():
+            pipe.hincrby(_redis_metrics_key(), field, int(delta))
+        pipe.execute()
+    except Exception:
+        pass
+    finally:
+        _redis_observe_metric_ms("redis_queue_counter_update", (time.perf_counter() - start_perf) * 1000.0)
+
+
+def _redis_read_queue_counters() -> dict[str, int]:
+    if not _use_redis_queue():
+        return {}
+    start_perf = time.perf_counter()
+    try:
+        raw = _redis_client().hgetall(_redis_metrics_key()) or {}
+    except Exception:
+        raw = {}
+    out: dict[str, int] = {}
+    for key in (
+        "queued",
+        "queued_realtime",
+        "queued_priority",
+        "queued_bulk",
+        "running",
+        "state_queued",
+        "state_running",
+        "state_success",
+        "state_failed",
+        "state_cancelled",
+        "state_expired",
+        "queue_wait_count",
+        "queue_wait_ms_total",
+        "queue_wait_ms_last",
+        "task_runtime_count",
+        "task_runtime_ms_total",
+        "task_runtime_ms_last",
+        "ocr_runtime_count",
+        "ocr_runtime_ms_total",
+        "ocr_runtime_ms_last",
+        "worker_rss_kb_last",
+        "temp_fs_used_bytes_last",
+        "temp_entry_count_last",
+        "stuck_recovered_inflight_total",
+        "stuck_requeued_lease_total",
+        "worker_soft_failures_total",
+        "worker_soft_failures_transient",
+        "worker_soft_failures_unexpected",
+        "ocr_timeouts_total",
+        "redis_queue_counter_read_ms_last",
+        "redis_queue_metrics_ms_last",
+        "redis_worker_heartbeat_ms_last",
+        "redis_queue_counter_update_ms_last",
+        "redis_claim_pop_ms_last",
+        "redis_claim_task_fetch_ms_last",
+    ):
+        try:
+            out[key] = max(0, int(raw.get(key) or 0))
+        except Exception:
+            out[key] = 0
+    _redis_observe_metric_ms("redis_queue_counter_read", (time.perf_counter() - start_perf) * 1000.0)
+    return out
+
+
+def _redis_mark_inflight(task_id: str, *, queue_name: str) -> None:
+    if not task_id:
+        return
+    try:
+        _redis_client().zadd(_redis_inflight_index_key(), {str(task_id): time.time()})
+    except Exception:
+        pass
+
+
+def _redis_unmark_inflight(task_id: str) -> None:
+    if not task_id:
+        return
+    try:
+        _redis_client().zrem(_redis_inflight_index_key(), str(task_id))
+    except Exception:
+        pass
 
 
 def _redis_idem_key(user_id: int, task_type: str, idem_key: str) -> str:
@@ -176,11 +572,17 @@ def _normalize_redis_task(data: dict) -> dict:
             summary = json.loads(summary or "{}")
         except Exception:
             summary = {}
+    queue_class = str(data.get("queue_class") or "").strip().lower()
+    if not queue_class:
+        queue_class = _task_queue_class(str(data.get("task_type") or ""), payload)
+    queue_name = str(data.get("queue_name") or "").strip() or _redis_queue_name_for_class(queue_class)
     return {
         "task_id": str(data.get("task_id") or ""),
         "user_id": int(data.get("user_id") or 0),
         "job_id": int(data.get("job_id") or 0),
         "task_type": str(data.get("task_type") or ""),
+        "queue_class": queue_class,
+        "queue_name": queue_name,
         "status": str(data.get("status") or "queued"),
         "progress": int(data.get("progress") or 0),
         "message": str(data.get("message") or ""),
@@ -224,10 +626,70 @@ def _is_past_iso(ts: str) -> bool:
         return False
 
 
+def _recover_stale_redis_inflight_entries() -> int:
+    """Move stale inflight task IDs back to their source queue."""
+    if not _use_redis_queue():
+        return 0
+    cooldown_sec = max(3.0, float(os.getenv("REDIS_INFLIGHT_REPAIR_COOLDOWN_SEC", "10") or 10))
+    now_ts = time.time()
+    last_ts = float(_redis_inflight_repair_state.get("ts") or 0.0)
+    if now_ts - last_ts < cooldown_sec:
+        return 0
+    _redis_inflight_repair_state["ts"] = now_ts
+
+    max_repair = max(1, int(os.getenv("REDIS_INFLIGHT_REPAIR_MAX", "40") or 40))
+    stale_sec = max(30, int(os.getenv("REDIS_INFLIGHT_STALE_SEC", "300") or 300))
+    repaired = 0
+    client = _redis_client()
+    queues = _redis_queue_names_for_worker_role("all")
+    for queue_name in queues:
+        inflight = _redis_inflight_queue_name(queue_name)
+        task_ids = client.lrange(inflight, 0, max_repair - 1)
+        for task_id in task_ids or []:
+            if repaired >= max_repair:
+                break
+            try:
+                score = float(client.zscore(_redis_inflight_index_key(), str(task_id)) or 0.0)
+            except Exception:
+                score = 0.0
+            if score and (now_ts - score) < stale_sec:
+                continue
+            task = _redis_get_task(str(task_id))
+            if task and str(task.get("status") or "").strip().lower() in {"queued", "running"}:
+                status = str(task.get("status") or "").strip().lower()
+                target_queue = str(task.get("queue_name") or "").strip() or queue_name
+                pipe = client.pipeline(transaction=False)
+                pipe.lrem(inflight, 1, str(task_id))
+                pipe.rpush(target_queue, str(task_id))
+                pipe.zadd(_redis_inflight_index_key(), {str(task_id): now_ts})
+                pipe.execute()
+                if status == "running":
+                    _redis_adjust_queue_counters(
+                        queue_class=task.get("queue_class"),
+                        queued_delta=1,
+                        running_delta=-1,
+                    )
+                    _redis_adjust_state_counters(from_status="running", to_status="queued")
+                repaired += 1
+            else:
+                pipe = client.pipeline(transaction=False)
+                pipe.lrem(inflight, 1, str(task_id))
+                pipe.zrem(_redis_inflight_index_key(), str(task_id))
+                pipe.execute()
+    if repaired:
+        logger.warning("Recovered %s stale inflight Redis task(s)", repaired)
+        try:
+            _redis_client().hincrby(_redis_metrics_key(), "stuck_recovered_inflight_total", int(repaired))
+        except Exception:
+            pass
+    return repaired
+
+
 def _maybe_requeue_expired_redis_tasks() -> int:
     """Best-effort repair for stale Redis running tasks with expired leases."""
     if not _use_redis_queue():
         return 0
+    _recover_stale_redis_inflight_entries()
     cooldown_sec = max(2.0, float(os.getenv("REDIS_REQUEUE_SCAN_COOLDOWN_SEC", "8") or 8))
     now_ts = time.time()
     last_ts = float(_redis_requeue_scan_state.get("ts") or 0.0)
@@ -262,10 +724,19 @@ def _maybe_requeue_expired_redis_tasks() -> int:
         task["message"] = "Requeued after lease timeout"
         task["updated_at"] = _utc_now_iso()
         _redis_put_task(task)
-        client.rpush(queue_name, str(task.get("task_id") or ""))
+        _redis_adjust_state_counters(from_status="running", to_status="queued")
+        task_queue_name = str(task.get("queue_name") or "").strip() or _redis_queue_name_for_class(
+            task.get("queue_class")
+        )
+        client.rpush(task_queue_name, str(task.get("task_id") or ""))
+        _redis_adjust_queue_counters(queue_class=task.get("queue_class"), queued_delta=1, running_delta=-1)
         repaired += 1
     if repaired:
         logger.warning("Requeued %s stale Redis running task(s) after lease timeout", repaired)
+        try:
+            _redis_client().hincrby(_redis_metrics_key(), "stuck_requeued_lease_total", int(repaired))
+        except Exception:
+            pass
     return repaired
 
 
@@ -314,7 +785,7 @@ def _hydrate_s3_inputs_if_needed(task: dict) -> None:
     if not input_refs:
         return
     store = _s3_store()
-    tmpdir = tempfile.mkdtemp(prefix=f"worker_task_{task.get('task_id')}_")
+    tmpdir = make_temp_dir(prefix=f"worker_task_{task.get('task_id')}_")
     local_paths: list[str] = []
     for idx, ref in enumerate(input_refs):
         key = str(ref.get("key") if isinstance(ref, dict) else ref).strip()
@@ -499,7 +970,7 @@ def _read_result_bytes(source_path: str) -> bytes | None:
         return None
     try:
         if raw.lower().startswith("s3://"):
-            cleanup_dir = tempfile.mkdtemp(prefix="artifact_snapshot_")
+            cleanup_dir = make_temp_dir(prefix="artifact_snapshot_")
             try:
                 from hybrid.storage import parse_s3_uri_to_bucket_key
                 _bucket, obj_key = parse_s3_uri_to_bucket_key(raw)
@@ -811,19 +1282,85 @@ def _task_ocr_source_platform(task: dict) -> str:
     return _infer_ocr_master_platform_from_result_path(task.get("result_path"))
 
 
+def _infer_ocr_platform_from_record(record: dict) -> str:
+    """Best-effort platform classifier for OCR master rows.
+
+    Used for dashboard-driven bulk historical OCR uploads where PDFs can be a
+    mixed batch of Meesho + Flipkart labels.
+    """
+    row = record or {}
+    order_id = str(row.get("Order_id") or "").strip().upper()
+    courier_partner = re.sub(r"\s+", " ", str(row.get("Courier_Partner") or "").strip().lower())
+    sold_by = re.sub(r"\s+", " ", str(row.get("Sold_By") or "").strip().lower())
+    company = re.sub(
+        r"\s+",
+        " ",
+        str(
+            row.get("Label_Company")
+            or row.get("Company")
+            or row.get("Marketplace")
+            or row.get("Platform")
+            or row.get("source_platform")
+            or ""
+        ).strip().lower(),
+    )
+
+    # Highest-confidence signals first.
+    if "meesho" in company:
+        return "meesho"
+    if "flipkart" in company or "shopsy" in company:
+        return "flipkart"
+
+    # Order ID format is usually the most reliable indicator.
+    if re.fullmatch(r"\d{14,24}[_-]\d+", order_id):
+        return "meesho"
+    if order_id.startswith("OD"):
+        return "flipkart"
+
+    # Seller text can explicitly indicate channel.
+    if "meesho" in sold_by:
+        return "meesho"
+    if "flipkart" in sold_by or "shopsy" in sold_by:
+        return "flipkart"
+
+    # Courier fallback (lowest confidence).
+    if any(
+        token in courier_partner
+        for token in ("shadowfax", "delhivery", "xpress", "xpressbees", "valmo", "valmoplus")
+    ):
+        return "meesho"
+    if "e-kart" in courier_partner or "ekart" in courier_partner:
+        return "flipkart"
+
+    return ""
+
+
 def _redis_latest_successful_ocr_snapshot(user_id: int, norm_platform: str) -> dict | None:
     """Resolve latest successful OCR master from Redis (worker truth in queue mode)."""
     if not redis_ocr_master_lookup_enabled():
         return None
     try:
         client = _redis_client()
-        task_ids = client.zrevrange(_redis_user_tasks_key(int(user_id)), 0, 299)
+        scan_limit = max(20, min(400, int(os.getenv("REDIS_OCR_LOOKUP_TASK_SCAN_LIMIT", "120") or 120)))
+        task_ids = client.zrevrange(_redis_user_tasks_key(int(user_id)), 0, max(0, scan_limit - 1))
     except Exception:
         logger.exception("Redis OCR master lookup failed user_id=%s", user_id)
         return None
+    id_list = [str(raw_id) for raw_id in (task_ids or []) if str(raw_id)]
+    if not id_list:
+        return None
+    try:
+        raw_tasks = client.mget([_redis_task_key(task_id) for task_id in id_list])
+    except Exception:
+        raw_tasks = []
     scored: list[tuple[str, dict]] = []
-    for raw_id in task_ids or []:
-        task = _redis_get_task(str(raw_id))
+    for raw in raw_tasks or []:
+        if not raw:
+            continue
+        try:
+            task = _normalize_redis_task(json.loads(raw))
+        except Exception:
+            continue
         if not task:
             continue
         if task.get("task_type") not in {"ocr_csv", "ocr_excel"}:
@@ -2648,6 +3185,101 @@ def _split_pdf_inputs_by_multi_order_customer(
     return rest_paths, multi_paths, total_pages, multi_pages, len(multi_keys)
 
 
+def _normalize_sku_for_grouping(value: object) -> str:
+    return re.sub(r"\s+", "", str(value or "").strip().upper())
+
+
+def _sanitize_group_label(value: object) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"\s+", " ", text)
+    return text[:80]
+
+
+def _safe_group_filename_part(value: object) -> str:
+    text = str(value or "").strip()
+    safe = re.sub(r"[^a-zA-Z0-9._-]+", "-", text).strip("-._")
+    return safe[:64] or "Group"
+
+
+def _parse_sku_group_map_option(raw: object) -> dict[str, str]:
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for raw_sku, raw_group in raw.items():
+        sku = _normalize_sku_for_grouping(raw_sku)
+        group = _sanitize_group_label(raw_group)
+        if sku and group:
+            out[sku] = group
+    return out
+
+
+def _split_pdf_inputs_by_sku_groups(
+    input_paths: list[str],
+    *,
+    sku_group_map: dict[str, str],
+    output_dir: str,
+    group_file_prefix: str = "sku_group_source",
+    ungrouped_prefix: str = "sku_group_rest",
+) -> tuple[list[str], dict[str, list[str]], int, int, dict[str, int]]:
+    """Split PDFs into per-group and ungrouped pools using parsed page SKU.
+
+    Returns ``(ungrouped_paths, grouped_paths_map, total_pages, grouped_pages, grouped_counts)``.
+    """
+    clean_map = _parse_sku_group_map_option(sku_group_map)
+    if not input_paths or not clean_map:
+        return list(input_paths or []), {}, 0, 0, {}
+
+    grouped_paths: dict[str, list[str]] = {}
+    grouped_counts: dict[str, int] = {}
+    ungrouped_paths: list[str] = []
+    total_pages = 0
+    grouped_pages = 0
+
+    for idx, path in enumerate(input_paths):
+        with fitz.open(path) as src:
+            docs_by_group: dict[str, fitz.Document] = {}
+            ungrouped_doc = fitz.open()
+            try:
+                for page_idx in range(len(src)):
+                    total_pages += 1
+                    page = src[page_idx]
+                    text = page.get_text("text") or ""
+                    parsed = parse_required_fields(text or "") if text else {}
+                    sku = _normalize_sku_for_grouping((parsed or {}).get("Sku") or (parsed or {}).get("SKU") or "")
+                    group_label = clean_map.get(sku, "")
+                    if group_label:
+                        target_doc = docs_by_group.get(group_label)
+                        if target_doc is None:
+                            target_doc = fitz.open()
+                            docs_by_group[group_label] = target_doc
+                        target_doc.insert_pdf(src, from_page=page_idx, to_page=page_idx)
+                        grouped_pages += 1
+                        grouped_counts[group_label] = grouped_counts.get(group_label, 0) + 1
+                    else:
+                        ungrouped_doc.insert_pdf(src, from_page=page_idx, to_page=page_idx)
+
+                if len(ungrouped_doc):
+                    rest_path = str(Path(output_dir) / f"{ungrouped_prefix}_{idx}.pdf")
+                    ungrouped_doc.save(rest_path)
+                    ungrouped_paths.append(rest_path)
+                for group_label, doc in docs_by_group.items():
+                    if not len(doc):
+                        continue
+                    safe_group = _safe_group_filename_part(group_label)
+                    group_path = str(Path(output_dir) / f"{group_file_prefix}_{safe_group}_{idx}.pdf")
+                    doc.save(group_path)
+                    grouped_paths.setdefault(group_label, []).append(group_path)
+            finally:
+                ungrouped_doc.close()
+                for doc in docs_by_group.values():
+                    try:
+                        doc.close()
+                    except Exception:
+                        pass
+
+    return ungrouped_paths, grouped_paths, total_pages, grouped_pages, grouped_counts
+
+
 def _count_courier_partners(
     input_paths: list[str],
     *,
@@ -2673,13 +3305,17 @@ def _count_courier_partners(
         text = str(value or "").strip()
         if not text:
             return ""
-        # Flipkart Sold_By OCR may include address tail after comma/newline.
-        # Keep only the storefront/company name segment.
-        first_line = text.splitlines()[0].strip()
-        for sep in (",", ";", "|"):
-            if sep in first_line:
-                first_line = first_line.split(sep, 1)[0].strip()
-        return first_line
+        # Keep seller label stable for bucketing while trimming obvious tails.
+        merged = " ".join(part.strip() for part in text.splitlines() if part and part.strip())
+        merged = re.sub(r"\s{2,}", " ", merged).strip(" \t|:;,.")
+        merged = re.sub(r"(?i)^sold\s*b[yv]\s*[:\-–—|]?\s*", "", merged).strip(" \t|:;,.")
+        stop = re.search(
+            r"(?i)\b(gstin|invoice|order\s*id|awb|shipping\s*address|bill\s*to|phone|mobile|fssai)\b",
+            merged,
+        )
+        if stop:
+            merged = merged[: stop.start()].strip(" \t|:;,.")
+        return merged[:140]
 
     counts: dict[str, int] = {}
     total = 0
@@ -3026,6 +3662,35 @@ def _sync_local_task_from_redis(task: dict) -> None:
             )
 
 
+def _sync_local_task_from_redis_if_needed(task: dict, *, min_interval_sec: float = 2.0) -> bool:
+    """Avoid redundant local mirror writes when Redis task state is unchanged."""
+    task_id = str(task.get("task_id") or "").strip()
+    if not task_id:
+        return False
+    sync_marker = "|".join(
+        [
+            str(task.get("updated_at") or ""),
+            str(task.get("status") or ""),
+            str(task.get("progress") or ""),
+            str(task.get("result_path") or ""),
+        ]
+    )
+    now_ts = time.time()
+    cached = _redis_local_sync_cache.get(task_id) or {}
+    cached_marker = str(cached.get("marker") or "")
+    cached_ts = float(cached.get("ts") or 0.0)
+    if sync_marker and sync_marker == cached_marker and (now_ts - cached_ts) < max(0.0, float(min_interval_sec)):
+        return False
+    _sync_local_task_from_redis(task)
+    _redis_local_sync_cache[task_id] = {"marker": sync_marker, "ts": now_ts}
+    if len(_redis_local_sync_cache) > 8000:
+        cutoff = now_ts - 3600.0
+        stale_ids = [k for k, v in _redis_local_sync_cache.items() if float((v or {}).get("ts") or 0.0) < cutoff]
+        for stale_id in stale_ids[:3000]:
+            _redis_local_sync_cache.pop(stale_id, None)
+    return True
+
+
 def _sync_processing_tasks_row(task: dict) -> None:
     summary = task.get("summary") or {}
     if not isinstance(summary, dict):
@@ -3228,6 +3893,8 @@ def _enqueue_internal_redis_task(*, user_id: int, job_id: int, task_type: str, p
         raise RuntimeError("Internal fan-out tasks require Redis queue backend")
     if task_type not in INTERNAL_TASK_TYPES:
         raise ValueError(f"Unsupported internal task type: {task_type}")
+    queue_class = str(payload.get("queue_class") or _task_queue_class(task_type, payload) or "realtime")
+    queue_name = _redis_queue_name_for_class(queue_class)
     task_id = uuid.uuid4().hex
     now_iso = _utc_now_iso()
     task = {
@@ -3235,6 +3902,8 @@ def _enqueue_internal_redis_task(*, user_id: int, job_id: int, task_type: str, p
         "user_id": int(user_id),
         "job_id": int(job_id),
         "task_type": task_type,
+        "queue_class": queue_class,
+        "queue_name": queue_name,
         "status": "queued",
         "progress": 1,
         "message": message,
@@ -3251,8 +3920,12 @@ def _enqueue_internal_redis_task(*, user_id: int, job_id: int, task_type: str, p
         "finished_at": "",
     }
     client = _redis_client()
-    client.set(_redis_task_key(task_id), json.dumps(task, ensure_ascii=True))
-    client.rpush(_redis_queue_name(), task_id)
+    pipe = client.pipeline(transaction=False)
+    pipe.set(_redis_task_key(task_id), json.dumps(task, ensure_ascii=True))
+    pipe.rpush(queue_name, task_id)
+    pipe.execute()
+    _redis_adjust_queue_counters(queue_class=queue_class, queued_delta=1)
+    _redis_adjust_state_counters(to_status="queued")
     return task_id
 
 
@@ -3261,12 +3934,16 @@ def enqueue_task(*, user_id: int, job_id: int, task_type: str, payload: dict) ->
         raise ValueError(f"Unsupported task type: {task_type}")
     task_id = uuid.uuid4().hex
     now_iso = _utc_now_iso()
+    queue_class = _task_queue_class(task_type, payload)
+    queue_name = _redis_queue_name_for_class(queue_class)
     if _use_redis_queue():
         task = {
             "task_id": task_id,
             "user_id": int(user_id),
             "job_id": int(job_id),
             "task_type": task_type,
+            "queue_class": queue_class,
+            "queue_name": queue_name,
             "status": "queued",
             "progress": 1,
             "message": "Queued",
@@ -3283,9 +3960,13 @@ def enqueue_task(*, user_id: int, job_id: int, task_type: str, payload: dict) ->
             "finished_at": "",
         }
         client = _redis_client()
-        client.set(_redis_task_key(task_id), json.dumps(task, ensure_ascii=True))
-        client.zadd(_redis_user_tasks_key(int(user_id)), {task_id: time.time()})
-        client.rpush(_redis_queue_name(), task_id)
+        pipe = client.pipeline(transaction=False)
+        pipe.set(_redis_task_key(task_id), json.dumps(task, ensure_ascii=True))
+        pipe.zadd(_redis_user_tasks_key(int(user_id)), {task_id: time.time()})
+        pipe.rpush(queue_name, task_id)
+        pipe.execute()
+        _redis_adjust_queue_counters(queue_class=queue_class, queued_delta=1)
+        _redis_adjust_state_counters(to_status="queued")
         _shadow_insert_local_task(
             task_id=task_id,
             user_id=user_id,
@@ -3338,9 +4019,30 @@ def _is_premium_crop_options_enabled(options: dict | None) -> bool:
         or _option_bool(options.get("mark_loyal_customer_preview"))
         or _option_bool(options.get("markLoyalCustomerPreview"))
         or _option_bool(options.get("loyal_preview_enabled"))
+        or _option_bool(options.get("sort_group_wise"))
+        or _option_bool(options.get("sortGroupWise"))
+        or _option_bool(options.get("group_sort_enabled"))
         or _option_bool(options.get("pincode_split_enabled"))
         or separate_pincodes
     )
+
+
+def _task_queue_class(task_type: object, payload: dict | None) -> str:
+    t = str(task_type or "").strip().lower()
+    p = payload if isinstance(payload, dict) else {}
+    explicit = str(p.get("queue_class") or p.get("queueClass") or "").strip().lower()
+    if explicit in {"realtime", "bulk", "priority"}:
+        return explicit
+    options = p.get("options") if isinstance(p.get("options"), dict) else {}
+    if t in {"ocr_csv", "ocr_excel"}:
+        if _option_bool((options or {}).get("historical_mode")) or _option_bool(p.get("historical_mode")):
+            return "bulk"
+        return "realtime"
+    if t in {"crop_meesho", "crop_flipkart", "crop_meesho_chunk", "crop_flipkart_chunk", "crop_finalize"}:
+        if _is_premium_crop_options_enabled(options):
+            return "priority"
+        return "realtime"
+    return "realtime"
 
 
 def _apply_premium_crop_billing(task: dict, summary: dict, options: dict) -> dict:
@@ -3375,6 +4077,8 @@ def _apply_premium_crop_billing(task: dict, summary: dict, options: dict) -> dic
     if coins <= 0:
         return billing
 
+    task_id = str(task.get("task_id") or "").strip()
+    charge_key = f"premium-crop:{task_id}" if task_id else ""
     try:
         result = spend_wallet_coins(
             user_id=int(task.get("user_id") or 0),
@@ -3382,7 +4086,9 @@ def _apply_premium_crop_billing(task: dict, summary: dict, options: dict) -> dic
             note=(
                 f"{str(task.get('task_type') or 'Crop')} premium crop "
                 f"({label_count} label{'s' if label_count != 1 else ''})"
+                f"{f' task:{task_id}' if task_id else ''}"
             ),
+            idempotency_key=charge_key,
         )
         if not (isinstance(result, dict) and result.get("ok")):
             billing["premium_billing_error"] = "Insufficient wallet balance."
@@ -3444,6 +4150,8 @@ def get_or_create_idempotent_task(
     ph = _payload_hash(payload)
     now_iso = _utc_now_iso()
     task_id = uuid.uuid4().hex
+    queue_class = _task_queue_class(task_type, payload)
+    queue_name = _redis_queue_name_for_class(queue_class)
     resolved_task_id = ""
     created = False
 
@@ -3487,6 +4195,8 @@ def get_or_create_idempotent_task(
                 "user_id": int(user_id),
                 "job_id": int(job_id),
                 "task_type": task_type,
+                "queue_class": queue_class,
+                "queue_name": queue_name,
                 "status": "queued",
                 "progress": 1,
                 "message": "Queued",
@@ -3504,7 +4214,7 @@ def get_or_create_idempotent_task(
             }
             client.set(_redis_task_key(task_id), json.dumps(task, ensure_ascii=True))
             client.zadd(_redis_user_tasks_key(int(user_id)), {task_id: time.time()})
-            client.rpush(_redis_queue_name(), task_id)
+            client.rpush(queue_name, task_id)
             _shadow_insert_local_task(
                 task_id=task_id,
                 user_id=user_id,
@@ -3591,7 +4301,7 @@ def get_task_for_user(task_id: str, user_id: int) -> dict | None:
         # Mirror current Redis state into the local processing_tasks/crop_jobs
         # rows so the API's history list (read from SQLite) reflects the
         # actual worker outcome and reveals the Download button.
-        _sync_local_task_from_redis(task)
+        _sync_local_task_from_redis_if_needed(task, min_interval_sec=2.0)
         return task
 
     with _db_connect() as conn:
@@ -3679,18 +4389,26 @@ def sync_recent_user_tasks_from_redis(user_id: int, *, limit: int = 50) -> int:
         logger.exception("sync_recent_user_tasks_from_redis failed to list user tasks user_id=%s", user_id)
         return 0
 
+    id_list = [str(task_id) for task_id in (task_ids or []) if str(task_id)]
+    if not id_list:
+        return 0
+    try:
+        raw_tasks = client.mget([_redis_task_key(task_id) for task_id in id_list])
+    except Exception:
+        raw_tasks = []
+
     synced = 0
-    for task_id in task_ids or []:
+    for raw in raw_tasks or []:
+        if not raw:
+            continue
         try:
-            task = _redis_get_task(str(task_id))
-            if not task:
-                continue
+            task = _normalize_redis_task(json.loads(raw))
             if task.get("task_type") not in {"crop_meesho", "crop_flipkart", "ocr_csv", "ocr_excel"}:
                 continue
-            _sync_local_task_from_redis(task)
-            synced += 1
+            if _sync_local_task_from_redis_if_needed(task, min_interval_sec=5.0):
+                synced += 1
         except Exception:
-            logger.exception("sync_recent_user_tasks_from_redis failed task_id=%s", task_id)
+            logger.exception("sync_recent_user_tasks_from_redis failed while mirroring a task")
     return synced
 
 
@@ -3701,6 +4419,7 @@ def _update_task(task_id: str, **fields) -> None:
         task = _redis_get_task(task_id)
         if not task:
             return
+        prev_status = str(task.get("status") or "").strip().lower()
         for key, value in fields.items():
             if key == "payload_json":
                 try:
@@ -3716,6 +4435,9 @@ def _update_task(task_id: str, **fields) -> None:
                 task[key] = value
         task["updated_at"] = _utc_now_iso()
         _redis_put_task(task)
+        new_status = str(task.get("status") or "").strip().lower()
+        if new_status and new_status != prev_status:
+            _redis_adjust_state_counters(from_status=prev_status, to_status=new_status)
         return
 
     set_sql = []
@@ -3782,39 +4504,87 @@ def _fetch_task_by_id(task_id: str) -> dict | None:
     }
 
 
-def _claim_next_task(worker_id: str, lease_seconds: int = 180) -> dict | None:
+def _claim_next_task(worker_id: str, lease_seconds: int | None = None, worker_role: str = "all") -> dict | None:
     now_iso = _utc_now_iso()
-    lease_expires = (_utc_now() + timedelta(seconds=max(30, lease_seconds))).isoformat()
+    if lease_seconds is None:
+        try:
+            lease_seconds = int(os.getenv("TASK_LEASE_SECONDS", "7200") or 7200)
+        except Exception:
+            lease_seconds = 7200
+    lease_expires = (_utc_now() + timedelta(seconds=max(30, int(lease_seconds)))).isoformat()
     task_id: str = ""
 
     if _use_redis_queue():
+        _redis_record_worker_heartbeat(worker_id, worker_role=worker_role)
         _maybe_requeue_expired_redis_tasks()
         client = _redis_client()
-        queue_name = _redis_queue_name()
+        queue_names = _redis_queue_names_for_worker_role(worker_role)
         max_claim_attempts = max(1, int(os.getenv("REDIS_CLAIM_ATTEMPTS", "6") or 6))
         for _attempt in range(max_claim_attempts):
-            popped = client.blpop(queue_name, timeout=1)
-            if not popped:
+            popped_queue = ""
+            task_id = ""
+            # Use BRPOPLPUSH-style handoff to an inflight list so a worker crash
+            # between dequeue and claim doesn't silently lose the queue entry.
+            claim_pop_start = time.perf_counter()
+            for idx, queue_name in enumerate(queue_names):
+                moved = client.brpoplpush(
+                    queue_name,
+                    _redis_inflight_queue_name(queue_name),
+                    timeout=1 if idx == 0 else 0,
+                )
+                if moved:
+                    popped_queue = queue_name
+                    task_id = str(moved)
+                    _redis_mark_inflight(task_id, queue_name=queue_name)
+                    break
+            _redis_observe_metric_ms("redis_claim_pop", (time.perf_counter() - claim_pop_start) * 1000.0)
+            if not task_id:
                 return None
-            _queue, task_id = popped
+            fetch_start = time.perf_counter()
             task = _redis_get_task(str(task_id))
+            _redis_observe_metric_ms("redis_claim_task_fetch", (time.perf_counter() - fetch_start) * 1000.0)
             if not task:
-                # Queue entry points to missing task metadata; skip safely.
+                # Queue entry points to missing task metadata; drop inflight entry.
+                pipe = client.pipeline(transaction=False)
+                pipe.lrem(_redis_inflight_queue_name(popped_queue), 1, str(task_id))
+                pipe.zrem(_redis_inflight_index_key(), str(task_id))
+                pipe.execute()
                 continue
             status = str(task.get("status") or "").strip().lower()
             claimable = status == "queued" or (status == "running" and _is_past_iso(str(task.get("lease_expires_at") or "")))
             if not claimable:
                 # Non-claimable status (already done/active elsewhere) should not block claim loop.
+                pipe = client.pipeline(transaction=False)
+                pipe.lrem(_redis_inflight_queue_name(popped_queue), 1, str(task_id))
+                pipe.zrem(_redis_inflight_index_key(), str(task_id))
+                pipe.execute()
                 continue
+            prev_status = status
             task["status"] = "running"
             task["worker_id"] = worker_id
             task["lease_expires_at"] = lease_expires
+            task["queue_name"] = str(task.get("queue_name") or "").strip() or str(popped_queue or "")
+            task["queue_class"] = str(task.get("queue_class") or "").strip().lower() or _task_queue_class(
+                task.get("task_type"),
+                task.get("payload") if isinstance(task.get("payload"), dict) else {},
+            )
             task["started_at"] = task.get("started_at") or now_iso
             task["attempts"] = int(task.get("attempts") or 0) + 1
             task["message"] = "Running"
             task["progress"] = max(2, int(task.get("progress") or 0))
             task["updated_at"] = now_iso
+            created_epoch = _safe_iso_to_epoch(task.get("created_at"))
+            if created_epoch > 0:
+                queue_wait_ms = max(0.0, (time.time() - created_epoch) * 1000.0)
+                _redis_observe_runtime_histogram("queue_wait", queue_wait_ms)
             _redis_put_task(task)
+            pipe = client.pipeline(transaction=False)
+            pipe.lrem(_redis_inflight_queue_name(popped_queue), 1, str(task_id))
+            pipe.zrem(_redis_inflight_index_key(), str(task_id))
+            pipe.execute()
+            if prev_status == "queued":
+                _redis_adjust_queue_counters(queue_class=task.get("queue_class"), queued_delta=-1, running_delta=1)
+                _redis_adjust_state_counters(from_status="queued", to_status="running")
             return task
         return None
 
@@ -3869,6 +4639,7 @@ def _claim_next_task(worker_id: str, lease_seconds: int = 180) -> dict | None:
 
 def _set_failed(task: dict, message: str) -> None:
     _progress_update_cache.pop(task["task_id"], None)
+    prev_status = str(task.get("status") or "").strip().lower()
     _update_task(
         task["task_id"],
         status="failed",
@@ -3878,10 +4649,13 @@ def _set_failed(task: dict, message: str) -> None:
         finished_at=_utc_now_iso(),
         lease_expires_at="",
     )
+    if _use_redis_queue() and prev_status == "running":
+        _redis_adjust_queue_counters(queue_class=task.get("queue_class"), running_delta=-1)
 
 
 def _set_success(task: dict, *, result_path: str, summary: dict) -> None:
     _progress_update_cache.pop(task["task_id"], None)
+    prev_status = str(task.get("status") or "").strip().lower()
     _update_task(
         task["task_id"],
         status="success",
@@ -3893,6 +4667,8 @@ def _set_success(task: dict, *, result_path: str, summary: dict) -> None:
         finished_at=_utc_now_iso(),
         lease_expires_at="",
     )
+    if _use_redis_queue() and prev_status == "running":
+        _redis_adjust_queue_counters(queue_class=task.get("queue_class"), running_delta=-1)
     try:
         _snapshot_task_analysis_artifacts(task, result_path=result_path, summary=summary or {})
     except Exception:
@@ -3933,6 +4709,97 @@ def _set_progress(task_id: str, progress: int, message: str, *, force: bool = Fa
     }
 
 
+def _renew_task_lease(task_id: str, *, worker_id: str, lease_seconds: int) -> bool:
+    """Extend task lease while a worker is still processing it."""
+    lease_expires = (_utc_now() + timedelta(seconds=max(30, int(lease_seconds)))).isoformat()
+    now_iso = _utc_now_iso()
+    if _use_redis_queue():
+        _redis_record_worker_heartbeat(
+            worker_id,
+            worker_role=(os.getenv("WORKER_QUEUE_ROLE", "all") or "all").strip().lower(),
+        )
+        task = _redis_get_task(task_id)
+        if not task:
+            return False
+        if str(task.get("status") or "").strip().lower() != "running":
+            return False
+        if str(task.get("worker_id") or "").strip() != str(worker_id or "").strip():
+            return False
+        task["lease_expires_at"] = lease_expires
+        task["updated_at"] = now_iso
+        _redis_put_task(task)
+        return True
+
+    def _do_update() -> bool:
+        with _db_connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE processing_tasks
+                SET lease_expires_at = ?, updated_at = ?
+                WHERE task_id = ?
+                  AND status = 'running'
+                  AND worker_id = ?
+                """,
+                (lease_expires, now_iso, task_id, worker_id),
+            )
+            return int(cur.rowcount or 0) > 0
+
+    try:
+        return bool(_run_with_db_lock_retry("lease renewal", _do_update))
+    except Exception:
+        return False
+
+
+def _task_lease_seconds() -> int:
+    try:
+        return max(30, int(os.getenv("TASK_LEASE_SECONDS", "7200") or 7200))
+    except Exception:
+        return 7200
+
+
+def _task_lease_heartbeat_interval(lease_seconds: int) -> float:
+    # Default to ~1/4 lease duration, bounded to avoid noisy writes.
+    default_interval = max(15.0, min(120.0, float(max(30, lease_seconds)) / 4.0))
+    try:
+        configured = float(os.getenv("TASK_LEASE_HEARTBEAT_SEC", str(default_interval)) or default_interval)
+    except Exception:
+        configured = default_interval
+    return max(5.0, min(300.0, configured))
+
+
+def _start_task_lease_heartbeat(task: dict) -> tuple[threading.Event | None, threading.Thread | None]:
+    """Start background lease renewer for long-running tasks."""
+    task_id = str(task.get("task_id") or "").strip()
+    worker_id = str(task.get("worker_id") or "").strip()
+    if not task_id or not worker_id:
+        return None, None
+    lease_seconds = _task_lease_seconds()
+    interval_sec = _task_lease_heartbeat_interval(lease_seconds)
+    stop_event = threading.Event()
+
+    def _loop() -> None:
+        while not stop_event.wait(timeout=interval_sec):
+            try:
+                ok = _renew_task_lease(task_id, worker_id=worker_id, lease_seconds=lease_seconds)
+                if not ok:
+                    break
+            except Exception:
+                logger.exception("Task lease heartbeat failed task_id=%s", task_id)
+                break
+
+    th = threading.Thread(target=_loop, name=f"lease-heartbeat-{task_id[:10]}", daemon=True)
+    th.start()
+    return stop_event, th
+
+
+def _stop_task_lease_heartbeat(stop_event: threading.Event | None, thread: threading.Thread | None) -> None:
+    if stop_event is None:
+        return
+    stop_event.set()
+    if thread and thread.is_alive():
+        thread.join(timeout=1.5)
+
+
 def _safe_pdf_page_count_from_path(path: str) -> int:
     try:
         with fitz.open(path) as doc:
@@ -3947,6 +4814,83 @@ def _cleanup_input_files(payload: dict) -> None:
             Path(p).unlink(missing_ok=True)
         except Exception:
             pass
+
+
+def _queued_task_depth_estimate() -> int:
+    """Best-effort queued depth for adaptive per-task worker sizing."""
+    try:
+        if _use_redis_queue():
+            client = _redis_client()
+            return int(sum(int(client.llen(name) or 0) for name in _redis_queue_names_for_worker_role("all")))
+        with _db_connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(1) AS cnt FROM processing_tasks WHERE status = 'queued'"
+            ).fetchone()
+            return int((row or {}).get("cnt") or 0) if isinstance(row, dict) else int(row["cnt"] or 0)
+    except Exception:
+        return 0
+
+
+def _worker_profile() -> str:
+    explicit = (os.getenv("WORKER_PROFILE", "") or "").strip().lower()
+    if explicit in {"realtime", "bulk", "balanced"}:
+        return explicit
+    role = (os.getenv("WORKER_QUEUE_ROLE", "all") or "all").strip().lower()
+    if role == "bulk":
+        return "bulk"
+    if role == "realtime":
+        return "realtime"
+    return "balanced"
+
+
+def _env_int_prefixed(prefix: str, key: str, default: int) -> int:
+    for env_key in (f"{prefix}{key}", key, f"OCR_{key}"):
+        raw = os.getenv(env_key, "").strip()
+        if not raw:
+            continue
+        try:
+            return int(raw)
+        except Exception:
+            continue
+    return int(default)
+
+
+def _effective_ocr_worker_count(*, requested_workers: int, total_input_files: int) -> tuple[int, int]:
+    """Derive per-task OCR worker count that preserves multi-tenant fairness.
+
+    Large OCR jobs can monopolize CPU if each task spawns high internal
+    concurrency. We adapt worker count by queue depth so many clients can make
+    progress concurrently instead of serial stop-and-go behavior.
+    """
+    cpu = max(1, int(os.cpu_count() or 4))
+    profile = _worker_profile()
+    profile_prefix = f"OCR_{profile.upper()}_"
+    hard_cap = _env_int_prefixed(profile_prefix, "MAX_WORKERS_PER_TASK", 6)
+    hard_cap = max(1, min(16, hard_cap))
+    max_active_processes = max(0, _env_int_prefixed(profile_prefix, "MAX_ACTIVE_PROCESSES", 0))
+    if max_active_processes > 0:
+        hard_cap = max(1, min(hard_cap, int(max_active_processes)))
+    baseline_default = _env_int_prefixed(profile_prefix, "DEFAULT_WORKERS_PER_TASK", 4)
+    baseline_default = max(1, min(hard_cap, baseline_default))
+
+    requested = int(requested_workers or 0)
+    base = requested if requested > 0 else baseline_default
+    base = max(1, min(base, hard_cap, max(1, int(total_input_files or 1)), cpu))
+
+    queued_depth = _queued_task_depth_estimate()
+    # Fair-share throttle: as backlog grows, reduce per-task threads so more
+    # workers can process different users in parallel.
+    q_hi = max(1, _env_int_prefixed(profile_prefix, "QUEUE_DEPTH_THROTTLE_HIGH", 80))
+    q_mid = max(1, _env_int_prefixed(profile_prefix, "QUEUE_DEPTH_THROTTLE_MEDIUM", 30))
+    q_low = max(1, _env_int_prefixed(profile_prefix, "QUEUE_DEPTH_THROTTLE_LOW", 10))
+    if queued_depth >= q_hi:
+        base = min(base, 1)
+    elif queued_depth >= q_mid:
+        base = min(base, 2)
+    elif queued_depth >= q_low:
+        base = min(base, 3)
+
+    return max(1, int(base)), int(queued_depth)
 
 
 def _crop_turbo_mode_enabled(options: dict | None = None) -> bool:
@@ -4013,7 +4957,7 @@ def _maybe_start_crop_fanout(task: dict) -> bool:
     job_id = int(task.get("job_id") or 0)
     task_type = str(task.get("task_type") or "")
     total_pages = int(payload.get("total_input_pages") or 0)
-    output_dir = payload.get("output_dir") or tempfile.mkdtemp(prefix=f"fanout_parent_{task_id}_")
+    output_dir = payload.get("output_dir") or make_temp_dir(prefix=f"fanout_parent_{task_id}_")
     chunk_count = _desired_fanout_chunks(total_pages)
 
     _set_progress(task_id, 5, f"Splitting PDF for {chunk_count} workers")
@@ -4071,7 +5015,7 @@ def _maybe_start_crop_fanout(task: dict) -> bool:
         "input_files": payload.get("input_files") or [],
         "total_input_files": int(payload.get("total_input_files") or 0),
         "total_input_pages": total_pages,
-        "output_dir": tempfile.mkdtemp(prefix=f"fanout_finalize_{task_id}_"),
+        "output_dir": make_temp_dir(prefix=f"fanout_finalize_{task_id}_"),
     }
     finalizer_id = _enqueue_internal_redis_task(
         user_id=user_id,
@@ -4112,8 +5056,8 @@ def _process_ocr_task(task: dict) -> tuple[str, dict]:
     source_platform = _normalize_ocr_platform(options.get("source_platform"))
     platform_master_path = _user_ocr_master_csv_path(user_id, source_platform or None)
     legacy_master_path = _user_ocr_master_csv_path(user_id, None)
-    output_path = str(platform_master_path)
-    max_workers = int(payload.get("max_workers") or 0)
+    output_path = str(legacy_master_path if not source_platform else platform_master_path)
+    requested_workers = int(payload.get("max_workers") or 0)
     job_id = int(task["job_id"])
     input_file_rows = payload.get("input_files") or []
     total_input_files = int(payload.get("total_input_files") or len(input_file_rows))
@@ -4124,7 +5068,19 @@ def _process_ocr_task(task: dict) -> tuple[str, dict]:
         task.get("task_id"),
         total_input_files,
         total_input_pages,
+        requested_workers,
+    )
+    max_workers, queue_depth_at_start = _effective_ocr_worker_count(
+        requested_workers=requested_workers,
+        total_input_files=total_input_files,
+    )
+    logger.info(
+        "OCR task worker allocation task_id=%s requested=%s effective=%s queued_depth=%s files=%s",
+        task.get("task_id"),
+        requested_workers,
         max_workers,
+        queue_depth_at_start,
+        total_input_files,
     )
 
     def _progress(stats: dict) -> None:
@@ -4134,11 +5090,29 @@ def _process_ocr_task(task: dict) -> tuple[str, dict]:
         pct = int((pages / max(1, total_input_pages)) * 90) if total_input_pages > 0 else int((processed_files / total_files) * 90)
         _set_progress(task["task_id"], max(3, min(95, pct)), f"Processed {processed_files}/{total_files} file(s)")
 
+    input_paths = payload.get("input_paths") or []
+    if not input_paths:
+        raise ValueError(
+            "No input PDFs available for OCR processing. Please re-upload and try again."
+        )
+
     records, report_rows, summary = extract_records_from_pdfs(
-        payload.get("input_paths") or [],
+        input_paths,
         max_workers=max_workers,
         progress_callback=_progress,
     )
+    if total_input_files > 0 and not records:
+        logger.warning(
+            "OCR task extracted zero rows task_id=%s files=%s pages=%s summary=%s",
+            task.get("task_id"),
+            total_input_files,
+            total_input_pages,
+            summary,
+        )
+        raise ValueError(
+            "OCR could not extract any label rows from the uploaded PDFs. "
+            "Please verify the PDFs are readable label files and retry."
+        )
     processed_at = _utc_now().strftime("%d-%m-%Y")
     dated_records: list[dict] = []
     for rec in records:
@@ -4146,41 +5120,102 @@ def _process_ocr_task(task: dict) -> tuple[str, dict]:
         row["Processed_At"] = processed_at
         dated_records.append(row)
     deduped_new_records, dedup_removed_new = deduplicate_records(dated_records)
-    existing_records = _read_csv_rows(platform_master_path)
-    existing_count = len(existing_records)
-    merged_records, replaced_existing_records = _merge_ocr_master_records(existing_records, deduped_new_records)
-    dedup_removed_merged = replaced_existing_records
-    # Keep a stable master schema so future daily merges are reliable.
-    csv_bytes = build_csv_bytes(
-        merged_records,
-        column_preset="standard_v1",
-        custom_columns="",
-    )
-    Path(output_path).write_bytes(csv_bytes)
-    merged_count = len(merged_records)
-    appended_rows = max(0, merged_count - existing_count)
+    existing_count = 0
+    merged_count = 0
+    appended_rows = 0
+    replaced_existing_records = 0
+    dedup_removed_merged = 0
+    platform_batch_counts: dict[str, int] = {platform: 0 for platform in SUPPORTED_OCR_PLATFORMS}
+    platform_master_totals: dict[str, int] = {}
+    cross_platform_rows_removed: dict[str, int] = {platform: 0 for platform in SUPPORTED_OCR_PLATFORMS}
+    unknown_platform_rows = 0
+
+    if source_platform:
+        existing_records = _read_csv_rows(platform_master_path)
+        existing_count = len(existing_records)
+        merged_records, replaced_existing_records = _merge_ocr_master_records(existing_records, deduped_new_records)
+        dedup_removed_merged = replaced_existing_records
+        csv_bytes = build_csv_bytes(
+            merged_records,
+            column_preset="standard_v1",
+            custom_columns="",
+        )
+        Path(platform_master_path).write_bytes(csv_bytes)
+        merged_count = len(merged_records)
+        appended_rows = max(0, merged_count - existing_count)
+        platform_batch_counts[source_platform] = len(deduped_new_records)
+        platform_master_totals[source_platform] = merged_count
+    else:
+        split_records: dict[str, list[dict]] = {platform: [] for platform in SUPPORTED_OCR_PLATFORMS}
+        unknown_records: list[dict] = []
+        for row in deduped_new_records:
+            inferred = _infer_ocr_platform_from_record(row)
+            if inferred in split_records:
+                split_records[inferred].append(row)
+            else:
+                unknown_records.append(row)
+        unknown_platform_rows = len(unknown_records)
+
+        total_existing_before_merge = 0
+        total_appended = 0
+        total_replaced = 0
+        for platform in SUPPORTED_OCR_PLATFORMS:
+            platform_path = _user_ocr_master_csv_path(user_id, platform)
+            raw_existing_records = _read_csv_rows(platform_path)
+            existing_records = [
+                row for row in raw_existing_records if _infer_ocr_platform_from_record(row) == platform
+            ]
+            cross_removed = max(0, len(raw_existing_records) - len(existing_records))
+            cross_platform_rows_removed[platform] = cross_removed
+            if cross_removed > 0:
+                logger.info(
+                    "OCR platform cleanup user_id=%s platform=%s removed_cross_rows=%s",
+                    user_id,
+                    platform,
+                    cross_removed,
+                )
+            incoming_records = split_records.get(platform) or []
+            platform_batch_counts[platform] = len(incoming_records)
+            existing_len = len(existing_records)
+            total_existing_before_merge += existing_len
+            if incoming_records or cross_removed > 0:
+                merged_records, replaced_existing = _merge_ocr_master_records(existing_records, incoming_records)
+                platform_bytes = build_csv_bytes(
+                    merged_records,
+                    column_preset="standard_v1",
+                    custom_columns="",
+                )
+                Path(platform_path).write_bytes(platform_bytes)
+                merged_len = len(merged_records)
+                total_appended += max(0, merged_len - existing_len)
+                total_replaced += int(replaced_existing)
+                platform_master_totals[platform] = merged_len
+            else:
+                platform_master_totals[platform] = existing_len
+        existing_count = total_existing_before_merge
+        appended_rows = total_appended
+        replaced_existing_records = total_replaced
+        dedup_removed_merged = total_replaced
 
     # Refresh the legacy union file as the union of every known per-platform
     # master plus any pre-existing legacy rows. This keeps consumers that
     # were not platform-aware (return analysis, manual-risk lookup, customer
     # history, loyal-customer evaluation) working without regression.
-    legacy_existing = _read_csv_rows(legacy_master_path) if (
-        source_platform and legacy_master_path.exists() and legacy_master_path != platform_master_path
-    ) else []
+    legacy_existing = _read_csv_rows(legacy_master_path) if legacy_master_path.exists() else []
     union_rows: list[dict] = list(legacy_existing)
     for platform in SUPPORTED_OCR_PLATFORMS:
         platform_path = _user_ocr_master_csv_path(user_id, platform)
-        if platform_path == platform_master_path:
-            union_rows.extend(merged_records)
-        elif platform_path.exists():
+        if platform_path.exists():
             try:
                 union_rows.extend(_read_csv_rows(platform_path))
             except Exception:
                 logger.exception("Failed to read platform master CSV at %s", platform_path)
-    if not source_platform:
-        # Manual OCR runs already wrote to the legacy file via merged_records;
-        # avoid double-writing.
-        union_rows = merged_records
+    if not source_platform and unknown_platform_rows > 0:
+        # Preserve rows we cannot confidently classify yet.
+        unknown_records = [
+            row for row in deduped_new_records if _infer_ocr_platform_from_record(row) not in SUPPORTED_OCR_PLATFORMS
+        ]
+        union_rows.extend(unknown_records)
     union_dedup, _ = _merge_ocr_master_records([], union_rows)
     union_bytes = build_csv_bytes(
         union_dedup,
@@ -4188,6 +5223,8 @@ def _process_ocr_task(task: dict) -> tuple[str, dict]:
         custom_columns="",
     )
     Path(legacy_master_path).write_bytes(union_bytes)
+    if not source_platform:
+        merged_count = len(union_dedup)
 
     duration_ms = int((time.perf_counter() - start_perf) * 1000)
     _safe_mark_crop_job_success(
@@ -4204,6 +5241,8 @@ def _process_ocr_task(task: dict) -> tuple[str, dict]:
             **options,
             "mode": "worker_queue",
             "workers": max_workers,
+            "workers_requested": requested_workers,
+            "queue_depth_at_start": int(queue_depth_at_start),
             "stored_on_server_only": True,
             "deduplicated_new_records": len(deduped_new_records),
             "duplicates_removed_new_batch": int(dedup_removed_new),
@@ -4214,6 +5253,10 @@ def _process_ocr_task(task: dict) -> tuple[str, dict]:
             "master_records_total": merged_count,
             "master_platform": source_platform or "legacy",
             "union_records_total": len(union_dedup),
+            "platform_split_counts": platform_batch_counts,
+            "platform_master_totals": platform_master_totals,
+            "cross_platform_rows_removed": cross_platform_rows_removed,
+            "unknown_platform_rows": int(unknown_platform_rows),
             **summary,
         },
     )
@@ -4226,6 +5269,10 @@ def _process_ocr_task(task: dict) -> tuple[str, dict]:
     summary_with_dedupe["master_records_total"] = merged_count
     summary_with_dedupe["master_platform"] = source_platform or "legacy"
     summary_with_dedupe["union_records_total"] = len(union_dedup)
+    summary_with_dedupe["platform_split_counts"] = platform_batch_counts
+    summary_with_dedupe["platform_master_totals"] = platform_master_totals
+    summary_with_dedupe["cross_platform_rows_removed"] = cross_platform_rows_removed
+    summary_with_dedupe["unknown_platform_rows"] = int(unknown_platform_rows)
     logger.info(
         "OCR task finished task_id=%s total_ms=%s extracted=%s merged_total=%s",
         task.get("task_id"),
@@ -4298,6 +5345,13 @@ def _process_crop_task(task: dict) -> tuple[str, dict]:
         "crop_meesho",
         "crop_flipkart",
     }
+    group_sort_enabled = _option_bool(effective_options.get("sort_group_wise")) and task_type in {
+        "crop_meesho",
+        "crop_flipkart",
+    }
+    sku_group_map = _parse_sku_group_map_option(effective_options.get("sku_group_map"))
+    if group_sort_enabled and not sku_group_map:
+        raise ValueError("Group-wise sorting was enabled but no saved SKU group mapping was found.")
     loyal_customer_enabled = _option_bool(effective_options.get("mark_loyal_customer")) and task_type in {
         "crop_meesho",
         "crop_flipkart",
@@ -4316,6 +5370,7 @@ def _process_crop_task(task: dict) -> tuple[str, dict]:
         detect_suspicious
         or selected_pincodes
         or multi_order_enabled
+        or group_sort_enabled
         or loyal_customer_enabled
         or loyal_preview_enabled
         or suspicious_preview_enabled
@@ -4399,6 +5454,13 @@ def _process_crop_task(task: dict) -> tuple[str, dict]:
         "multi_order_matched_labels": 0,
         "multi_order_pages": 0,
         "multi_order_normal_pages": total_input_pages,
+        "group_sort_enabled": bool(group_sort_enabled),
+        "group_sort_groups": 0,
+        "group_sort_grouped_pages": 0,
+        "group_sort_ungrouped_pages": total_input_pages,
+        "group_sort_counts": {},
+        "group_sort_source_filename": str(effective_options.get("sku_group_source_filename") or ""),
+        "group_sort_mapping_rows": int(effective_options.get("sku_group_row_count") or 0),
         # Loyal-customer star marking metrics (Meesho-only).
         "loyal_customer_enabled": bool(loyal_customer_enabled),
         "loyal_preview_enabled": bool(loyal_preview_enabled),
@@ -4479,6 +5541,7 @@ def _process_crop_task(task: dict) -> tuple[str, dict]:
     risky_input_paths: list[str] = []
     pincode_input_paths: list[str] = []
     multi_order_input_paths: list[str] = []
+    grouped_input_paths: dict[str, list[str]] = {}
     risky_pages = 0
     pincode_pages = 0
     multi_order_pages = 0
@@ -4540,6 +5603,32 @@ def _process_crop_task(task: dict) -> tuple[str, dict]:
     )
     stage_perf = time.perf_counter()
 
+    if group_sort_enabled and normal_input_paths:
+        _set_progress(task["task_id"], 50, "Grouping labels by SKU group")
+        (
+            normal_input_paths,
+            grouped_input_paths,
+            _group_total_pages,
+            grouped_pages,
+            grouped_counts,
+        ) = _split_pdf_inputs_by_sku_groups(
+            normal_input_paths,
+            sku_group_map=sku_group_map,
+            output_dir=output_dir,
+        )
+        risk_split_summary["group_sort_grouped_pages"] = int(grouped_pages)
+        risk_split_summary["group_sort_counts"] = dict(grouped_counts)
+        risk_split_summary["group_sort_groups"] = int(len(grouped_counts))
+        base_normal_pages = int(risk_split_summary.get("normal_pages", total_input_pages))
+        risk_split_summary["group_sort_ungrouped_pages"] = max(0, base_normal_pages - int(grouped_pages))
+        risk_split_summary["normal_pages"] = int(risk_split_summary["group_sort_ungrouped_pages"])
+    logger.info(
+        "Crop task stage done task_id=%s stage=group_sort_split elapsed_ms=%s",
+        task.get("task_id"),
+        int((time.perf_counter() - stage_perf) * 1000),
+    )
+    stage_perf = time.perf_counter()
+
     # Premium requests should have deterministic ZIP output even when a split
     # category has zero matches; users still need the premium summary/artifacts.
     split_active = bool(premium_checks_enabled)
@@ -4548,6 +5637,7 @@ def _process_crop_task(task: dict) -> tuple[str, dict]:
     risky_output_path = str(Path(output_dir) / "suspicious-labels.pdf")
     pincode_output_path = str(Path(output_dir) / "selected-pincode-labels.pdf")
     multi_order_output_path = str(Path(output_dir) / "multi-order-labels.pdf")
+    group_output_paths: dict[str, str] = {}
     fanout_child = _option_bool(options.get("__fanout_child"))
     child_annotation_mode = fanout_child and (
         task_type in {"crop_meesho_chunk", "crop_flipkart_chunk"}
@@ -4614,6 +5704,13 @@ def _process_crop_task(task: dict) -> tuple[str, dict]:
                 _run_meesho(risky_input_paths, risky_output_path)
             if multi_order_input_paths:
                 _run_meesho(multi_order_input_paths, multi_order_output_path)
+            for group_name, paths in grouped_input_paths.items():
+                if not paths:
+                    continue
+                safe_group = _safe_group_filename_part(group_name)
+                dest = str(Path(output_dir) / f"group-{safe_group}-labels.pdf")
+                _run_meesho(paths, dest)
+                group_output_paths[group_name] = dest
         elif task_type in {"crop_flipkart", "crop_flipkart_chunk"}:
             if normal_input_paths:
                 _run_flipkart(normal_input_paths, normal_output_path)
@@ -4623,6 +5720,13 @@ def _process_crop_task(task: dict) -> tuple[str, dict]:
                 _run_flipkart(risky_input_paths, risky_output_path)
             if multi_order_input_paths:
                 _run_flipkart(multi_order_input_paths, multi_order_output_path)
+            for group_name, paths in grouped_input_paths.items():
+                if not paths:
+                    continue
+                safe_group = _safe_group_filename_part(group_name)
+                dest = str(Path(output_dir) / f"group-{safe_group}-labels.pdf")
+                _run_flipkart(paths, dest)
+                group_output_paths[group_name] = dest
         else:
             raise ValueError(f"Unsupported crop task type: {task_type}")
 
@@ -4692,6 +5796,11 @@ def _process_crop_task(task: dict) -> tuple[str, dict]:
                 zf.write(pincode_output_path, arcname="Selected-Pincode-Labels.pdf")
             if Path(multi_order_output_path).exists():
                 zf.write(multi_order_output_path, arcname="Multi-Order-Labels.pdf")
+            for group_name in sorted(group_output_paths):
+                group_path = group_output_paths[group_name]
+                if Path(group_path).exists():
+                    safe_group = _safe_group_filename_part(group_name)
+                    zf.write(group_path, arcname=f"Group-{safe_group}-Labels.pdf")
             for _category, xlsx_path, _source_paths in split_excel_specs:
                 if Path(xlsx_path).exists():
                     zf.write(xlsx_path, arcname=Path(xlsx_path).name)
@@ -4718,6 +5827,7 @@ def _process_crop_task(task: dict) -> tuple[str, dict]:
         + int(risk_split_summary.get("risky_pages", 0))
         + int(risk_split_summary.get("selected_pincode_pages", 0))
         + int(risk_split_summary.get("multi_order_pages", 0))
+        + int(risk_split_summary.get("group_sort_grouped_pages", 0))
     )
     duration_ms = int((time.perf_counter() - start_perf) * 1000)
     summary = {
@@ -4782,7 +5892,7 @@ def _process_crop_finalize_task(task: dict) -> tuple[str, dict]:
     child_ids = [str(x) for x in (payload.get("child_task_ids") or []) if str(x)]
     if not parent_task_id or not child_ids:
         raise ValueError("Finalize task missing parent or child task ids")
-    output_dir = payload.get("output_dir") or tempfile.mkdtemp(prefix=f"fanout_finalize_{parent_task_id}_")
+    output_dir = payload.get("output_dir") or make_temp_dir(prefix=f"fanout_finalize_{parent_task_id}_")
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     start_perf = time.perf_counter()
     deadline = time.time() + PDF_FANOUT_FINALIZER_WAIT_SEC
@@ -4790,6 +5900,8 @@ def _process_crop_finalize_task(task: dict) -> tuple[str, dict]:
     if not parent_task:
         raise ValueError("Parent task is no longer available")
 
+    prev_done = -1
+    prev_progress = -1
     while True:
         children = [_redis_get_task(child_id) for child_id in child_ids]
         missing = [child_id for child_id, child in zip(child_ids, children) if not child]
@@ -4802,12 +5914,15 @@ def _process_crop_finalize_task(task: dict) -> tuple[str, dict]:
             _set_failed(parent_task, message)
             raise ValueError(message)
         done = [child for child in children if child and child.get("status") == "success" and child.get("result_path")]
-        progress = 10 + int((len(done) / max(1, len(child_ids))) * 78)
-        _update_task(
-            parent_task_id,
-            progress=max(10, min(92, progress)),
-            message=f"Processed {len(done)}/{len(child_ids)} PDF chunks",
-        )
+        progress = max(10, min(92, 10 + int((len(done) / max(1, len(child_ids))) * 78)))
+        if len(done) != prev_done or progress != prev_progress:
+            _update_task(
+                parent_task_id,
+                progress=progress,
+                message=f"Processed {len(done)}/{len(child_ids)} PDF chunks",
+            )
+            prev_done = len(done)
+            prev_progress = progress
         if len(done) == len(child_ids):
             break
         if time.time() > deadline:
@@ -4937,10 +6052,22 @@ def _process_return_analysis_task(task: dict) -> tuple[str, dict]:
     output_dir = payload.get("output_dir") or ""
     if not output_dir:
         raise ValueError("Return analysis task missing output directory")
-    returns_path = payload.get("returns_excel_path") or ""
-    orders_csv_path = payload.get("orders_csv_path") or ""
+    returns_path = str(payload.get("returns_excel_path") or "").strip()
+    input_paths = [str(p).strip() for p in (payload.get("input_paths") or []) if str(p).strip()]
+    if (not returns_path or not Path(returns_path).exists()) and input_paths:
+        # In Redis+S3 mode the worker hydrates uploaded files into input_paths.
+        returns_path = input_paths[0]
+    orders_csv_path = str(payload.get("orders_csv_path") or "").strip()
     if not returns_path or not orders_csv_path:
         raise ValueError("Return analysis payload missing input file paths")
+    if orders_csv_path.startswith("s3://"):
+        local_orders = str(Path(output_dir) / "orders-master.csv")
+        _download_s3_uri_to_file(orders_csv_path, local_orders)
+        orders_csv_path = local_orders
+    elif not Path(orders_csv_path).exists():
+        raise ValueError("Orders CSV is not available for return analysis.")
+    if not Path(returns_path).exists():
+        raise ValueError("Return Excel file is not available for return analysis.")
     start_perf = time.perf_counter()
     options = payload.get("options") or {}
     source_platform = _normalize_risk_platform(options.get("source_platform"))
@@ -5019,6 +6146,9 @@ def _process_one_task(task: dict) -> None:
     task_id = task["task_id"]
     payload = task.get("payload") or {}
     task_start_perf = time.perf_counter()
+    worker_id = str(task.get("worker_id") or "").strip()
+    worker_role = (os.getenv("WORKER_QUEUE_ROLE", "all") or "all").strip().lower()
+    lease_stop, lease_thread = _start_task_lease_heartbeat(task)
     try:
         _set_progress(task_id, 3, "Starting")
         _hydrate_s3_inputs_if_needed(task)
@@ -5054,17 +6184,38 @@ def _process_one_task(task: dict) -> None:
         if not _option_bool((payload.get("options") or {}).get("__fanout_child")):
             _safe_mark_crop_job_failed(task, error_message=str(exc), input_files=payload.get("input_files") or [])
         _set_failed(task, str(exc))
+        if worker_id:
+            record_worker_soft_failure(worker_id, error_name=type(exc).__name__, transient=False)
     except Exception as exc:
         logger.exception("Task failed: %s", task_id)
+        if str(task.get("task_type") or "").strip().lower() in {"ocr_csv", "ocr_excel"} and "timeout" in str(exc).lower():
+            try:
+                _redis_client().hincrby(_redis_metrics_key(), "ocr_timeouts_total", 1)
+            except Exception:
+                pass
         if not _option_bool((payload.get("options") or {}).get("__fanout_child")):
             _safe_mark_crop_job_failed(task, error_message=str(exc), input_files=payload.get("input_files") or [])
         _set_failed(task, str(exc))
+        if worker_id:
+            record_worker_soft_failure(worker_id, error_name=type(exc).__name__, transient=False)
     finally:
+        elapsed_ms = max(0.0, (time.perf_counter() - task_start_perf) * 1000.0)
+        _redis_observe_runtime_histogram("task_runtime", elapsed_ms)
+        task_type = str(task.get("task_type") or "").strip().lower()
+        _redis_observe_runtime_histogram(f"task_runtime_{task_type or 'unknown'}", elapsed_ms)
+        if task_type in {"ocr_csv", "ocr_excel"}:
+            _redis_observe_runtime_histogram("ocr_runtime", elapsed_ms)
+        if worker_id:
+            _redis_record_worker_runtime_sample(worker_id, worker_role=worker_role, force=True)
+        _stop_task_lease_heartbeat(lease_stop, lease_thread)
         _cleanup_input_files(payload)
 
 
 def run_worker_once(worker_id: str) -> bool:
-    task = _claim_next_task(worker_id)
+    role = (os.getenv("WORKER_QUEUE_ROLE", "all") or "all").strip().lower()
+    if _use_redis_queue():
+        _redis_record_worker_heartbeat(worker_id, worker_role=role)
+    task = _claim_next_task(worker_id, worker_role=role)
     if not task:
         return False
     _process_one_task(task)
@@ -5080,12 +6231,15 @@ def _worker_loop(worker_id: str, poll_interval_sec: float = 0.6) -> None:
             # alive and retry instead of crashing the thread.
             if "database is locked" in str(exc).lower():
                 logger.warning("Worker %s retrying after DB lock", worker_id)
+                record_worker_soft_failure(worker_id, error_name=type(exc).__name__, transient=True)
                 had = False
             else:
                 logger.exception("Worker %s hit database error", worker_id)
+                record_worker_soft_failure(worker_id, error_name=type(exc).__name__, transient=False)
                 had = False
-        except Exception:
+        except Exception as exc:
             logger.exception("Worker %s loop error", worker_id)
+            record_worker_soft_failure(worker_id, error_name=type(exc).__name__, transient=False)
             had = False
         if not had:
             _embedded_worker_stop.wait(timeout=max(0.2, poll_interval_sec))
@@ -5249,17 +6403,21 @@ def purge_finished_crop_artifacts(*, older_than_hours: int = 24) -> int:
         cutoff = (_utc_now() - timedelta(hours=max(1, int(older_than_hours)))).isoformat()
     now_iso = _utc_now_iso()
     cleaned = 0
+    pg_backend = is_postgres_backend()
+    ph = "%s" if pg_backend else "?"
+    output_dir_like = '%%"output_dir"%%' if pg_backend else '%"output_dir"%'
     with _db_connect() as conn:
-        rows = conn.execute(
-            """
+        exec_conn = getattr(conn, "_raw_conn", conn) if pg_backend else conn
+        rows = exec_conn.execute(
+            f"""
             SELECT task_id, result_path, payload_json
             FROM processing_tasks
             WHERE task_type IN ('crop_meesho', 'crop_flipkart')
               AND status IN ('success', 'failed', 'cancelled', 'expired')
-              AND updated_at < ?
+              AND updated_at < {ph}
               AND (
                 COALESCE(result_path, '') <> ''
-                OR COALESCE(payload_json, '') LIKE '%"output_dir"%'
+                OR COALESCE(payload_json, '') LIKE '{output_dir_like}'
               )
             """,
             (cutoff,),
@@ -5294,11 +6452,11 @@ def purge_finished_crop_artifacts(*, older_than_hours: int = 24) -> int:
 
             if "output_dir" in payload:
                 payload["output_dir"] = ""
-            conn.execute(
-                """
+            exec_conn.execute(
+                f"""
                 UPDATE processing_tasks
-                SET result_path = '', payload_json = ?, updated_at = ?
-                WHERE task_id = ?
+                SET result_path = '', payload_json = {ph}, updated_at = {ph}
+                WHERE task_id = {ph}
                 """,
                 (json.dumps(payload or {}, ensure_ascii=True), now_iso, task_id),
             )
@@ -5324,7 +6482,10 @@ def get_queue_metrics() -> dict:
             return 0
 
     if _use_redis_queue():
+        metrics_start = time.perf_counter()
         cache_ttl_sec = max(1.0, float(os.getenv("REDIS_QUEUE_METRICS_CACHE_SEC", "5") or 5))
+        deep_scan_sec = max(cache_ttl_sec, float(os.getenv("REDIS_QUEUE_METRICS_DEEP_SCAN_SEC", "60") or 60))
+        deep_scan_enabled = _env_flag("REDIS_QUEUE_METRICS_ENABLE_DEEP_SCAN", "0")
         now_ts = time.time()
         cached_payload = _queue_metrics_cache.get("payload")
         cached_ts = float(_queue_metrics_cache.get("ts") or 0.0)
@@ -5332,47 +6493,132 @@ def get_queue_metrics() -> dict:
             return dict(cached_payload)
 
         client = _redis_client()
-        queued = int(client.llen(_redis_queue_name()) or 0)
-        running = 0
-        failed_24h = 0
-        oldest_queued_at = ""
-        pattern = f"{_redis_queue_name()}:task:*"
-        cutoff = _utc_now() - timedelta(days=1)
-        scan_limit = max(100, int(os.getenv("REDIS_QUEUE_METRICS_SCAN_LIMIT", "2000") or 2000))
-        scanned = 0
-        for key in client.scan_iter(match=pattern, count=100):
-            scanned += 1
-            if scanned > scan_limit:
-                break
-            raw = client.get(key)
-            if not raw:
-                continue
-            try:
-                task = _normalize_redis_task(json.loads(raw))
-            except Exception:
-                continue
-            status = task.get("status")
-            if status == "running":
-                running += 1
-            elif status == "queued":
-                created = task.get("created_at") or ""
-                if not oldest_queued_at or created < oldest_queued_at:
-                    oldest_queued_at = created
-            elif status == "failed":
+        queued_realtime = int(client.llen(_redis_queue_name_for_class("realtime")) or 0)
+        queued_priority = int(client.llen(_redis_queue_name_for_class("priority")) or 0)
+        queued_bulk = int(client.llen(_redis_queue_name_for_class("bulk")) or 0)
+        queued = int(queued_realtime + queued_priority + queued_bulk)
+        counters = _redis_read_queue_counters()
+        running = int(counters.get("running") or 0)
+        state_queued = int(counters.get("state_queued") or 0)
+        state_running = int(counters.get("state_running") or 0)
+        state_success = int(counters.get("state_success") or 0)
+        state_failed = int(counters.get("state_failed") or 0)
+        state_cancelled = int(counters.get("state_cancelled") or 0)
+        state_expired = int(counters.get("state_expired") or 0)
+
+        # Reconcile counter drift using cheap queue depth and running estimates.
+        state_queued = max(state_queued, queued)
+        state_running = max(state_running, running)
+
+        oldest_queued_at = str(_queue_metrics_cache.get("oldest_queued_at") or "")
+        if not oldest_queued_at:
+            for qname in (
+                _redis_queue_name_for_class("priority"),
+                _redis_queue_name_for_class("realtime"),
+                _redis_queue_name_for_class("bulk"),
+            ):
                 try:
-                    updated = datetime.fromisoformat((task.get("updated_at") or "").replace("Z", "+00:00"))
-                    if updated >= cutoff:
-                        failed_24h += 1
+                    oldest_task_id = str(client.lindex(qname, 0) or "").strip()
                 except Exception:
-                    pass
+                    oldest_task_id = ""
+                if not oldest_task_id:
+                    continue
+                task = _redis_get_task(oldest_task_id) or {}
+                created = str(task.get("created_at") or "").strip()
+                if created and (not oldest_queued_at or created < oldest_queued_at):
+                    oldest_queued_at = created
+        worker_counts = _redis_active_worker_counts()
+        failed_24h = 0
+        try:
+            failed_24h = int(client.zcount(_redis_failed_events_key(), now_ts - 86400, "+inf") or 0)
+        except Exception:
+            failed_24h = int(_queue_metrics_cache.get("failed_24h") or 0)
+        queue_wait_count = int(counters.get("queue_wait_count") or 0)
+        queue_wait_total_ms = int(counters.get("queue_wait_ms_total") or 0)
+        queue_wait_avg_ms = int(queue_wait_total_ms / queue_wait_count) if queue_wait_count > 0 else 0
+        task_runtime_count = int(counters.get("task_runtime_count") or 0)
+        task_runtime_total_ms = int(counters.get("task_runtime_ms_total") or 0)
+        task_runtime_avg_ms = int(task_runtime_total_ms / task_runtime_count) if task_runtime_count > 0 else 0
+        ocr_runtime_count = int(counters.get("ocr_runtime_count") or 0)
+        ocr_runtime_total_ms = int(counters.get("ocr_runtime_ms_total") or 0)
+        ocr_runtime_avg_ms = int(ocr_runtime_total_ms / ocr_runtime_count) if ocr_runtime_count > 0 else 0
+
+        deep_scan_due = deep_scan_enabled and (
+            (not cached_payload) or ((now_ts - float(_queue_metrics_cache.get("deep_scan_ts") or 0.0)) >= deep_scan_sec)
+        )
+        if deep_scan_due:
+            oldest_queued_at = ""
+            pattern = f"{_redis_queue_name()}:task:*"
+            scan_limit = max(100, int(os.getenv("REDIS_QUEUE_METRICS_SCAN_LIMIT", "2000") or 2000))
+            scanned = 0
+            running_scan = 0
+            for key in client.scan_iter(match=pattern, count=100):
+                scanned += 1
+                if scanned > scan_limit:
+                    break
+                raw = client.get(key)
+                if not raw:
+                    continue
+                try:
+                    task = _normalize_redis_task(json.loads(raw))
+                except Exception:
+                    continue
+                status = task.get("status")
+                if status == "running":
+                    running_scan += 1
+                elif status == "queued":
+                    created = task.get("created_at") or ""
+                    if not oldest_queued_at or created < oldest_queued_at:
+                        oldest_queued_at = created
+            # Reconcile running counter periodically to bound drift.
+            running = max(running, running_scan)
+            _queue_metrics_cache["deep_scan_ts"] = now_ts
+            _queue_metrics_cache["oldest_queued_at"] = oldest_queued_at
+        elif not oldest_queued_at:
+            oldest_queued_at = ""
+        oldest_queued_age = _queued_age_sec(oldest_queued_at)
+        stuck_warn_sec = max(120, int(os.getenv("QUEUE_STUCK_WARN_SEC", "900") or 900))
         payload = {
             "queued": queued,
+            "queued_realtime": queued_realtime,
+            "queued_priority": queued_priority,
+            "queued_bulk": queued_bulk,
             "running": running,
+            "state_queued": state_queued,
+            "state_running": state_running,
+            "state_success": state_success,
+            "state_failed": state_failed,
+            "state_cancelled": state_cancelled,
+            "state_expired": state_expired,
+            "active_workers": int(worker_counts.get("active_workers") or 0),
+            "active_workers_realtime": int(worker_counts.get("active_workers_realtime") or 0),
+            "active_workers_bulk": int(worker_counts.get("active_workers_bulk") or 0),
             "failed_24h": failed_24h,
             "oldest_queued_at": oldest_queued_at,
-            "oldest_queued_age_sec": _queued_age_sec(oldest_queued_at),
+            "oldest_queued_age_sec": oldest_queued_age,
+            "queue_wait_ms_avg": queue_wait_avg_ms,
+            "queue_wait_ms_last": int(counters.get("queue_wait_ms_last") or 0),
+            "task_runtime_ms_avg": task_runtime_avg_ms,
+            "task_runtime_ms_last": int(counters.get("task_runtime_ms_last") or 0),
+            "ocr_runtime_ms_avg": ocr_runtime_avg_ms,
+            "ocr_runtime_ms_last": int(counters.get("ocr_runtime_ms_last") or 0),
+            "worker_rss_kb_last": int(counters.get("worker_rss_kb_last") or 0),
+            "temp_fs_used_bytes_last": int(counters.get("temp_fs_used_bytes_last") or 0),
+            "temp_entry_count_last": int(counters.get("temp_entry_count_last") or 0),
+            "stuck_recovered_inflight_total": int(counters.get("stuck_recovered_inflight_total") or 0),
+            "stuck_requeued_lease_total": int(counters.get("stuck_requeued_lease_total") or 0),
+            "worker_soft_failures_total": int(counters.get("worker_soft_failures_total") or 0),
+            "worker_soft_failures_transient": int(counters.get("worker_soft_failures_transient") or 0),
+            "worker_soft_failures_unexpected": int(counters.get("worker_soft_failures_unexpected") or 0),
+            "ocr_timeouts_total": int(counters.get("ocr_timeouts_total") or 0),
+            "queue_stuck_warning": bool(oldest_queued_age >= stuck_warn_sec and queued > 0),
+            "redis_op_metrics_ms_last": int(counters.get("redis_queue_counter_read_ms_last") or 0),
+            "redis_queue_metrics_ms_last": int(counters.get("redis_queue_metrics_ms_last") or 0),
+            "redis_claim_pop_ms_last": int(counters.get("redis_claim_pop_ms_last") or 0),
+            "redis_claim_task_fetch_ms_last": int(counters.get("redis_claim_task_fetch_ms_last") or 0),
             "generated_at": now_iso,
         }
+        _redis_observe_metric_ms("redis_queue_metrics", (time.perf_counter() - metrics_start) * 1000.0)
         _queue_metrics_cache["ts"] = now_ts
         _queue_metrics_cache["payload"] = payload
         return payload
@@ -5573,6 +6819,52 @@ def get_ocr_master_platform_status_for_user(user_id: int) -> dict:
             "row_count": int(summary.get("master_records_total") or 0),
         }
     return out
+
+
+def sanitize_ocr_master_data_for_user(user_id: int) -> dict:
+    """Rebuild per-platform/legacy OCR masters with strict platform separation.
+
+    This removes cross-mixed rows from platform files (e.g. Meesho rows in
+    Flipkart CSV) and refreshes the legacy union CSV from cleaned sources.
+    """
+    safe_user_id = int(user_id)
+    platform_removed: dict[str, int] = {}
+    platform_totals: dict[str, int] = {}
+    union_rows: list[dict] = []
+
+    for platform in SUPPORTED_OCR_PLATFORMS:
+        platform_path = _user_ocr_master_csv_path(safe_user_id, platform)
+        raw_rows = _read_csv_rows(platform_path) if platform_path.exists() else []
+        kept_rows = [row for row in raw_rows if _infer_ocr_platform_from_record(row) == platform]
+        deduped_rows, _ = _merge_ocr_master_records([], kept_rows)
+        removed = max(0, len(raw_rows) - len(deduped_rows))
+        platform_removed[platform] = removed
+        platform_totals[platform] = len(deduped_rows)
+        if deduped_rows or platform_path.exists():
+            platform_path.write_bytes(build_csv_bytes(deduped_rows, column_preset="standard_v1", custom_columns=""))
+        union_rows.extend(deduped_rows)
+
+    legacy_path = _user_ocr_master_csv_path(safe_user_id, None)
+    legacy_rows = _read_csv_rows(legacy_path) if legacy_path.exists() else []
+    unknown_legacy_rows = [
+        row for row in legacy_rows if _infer_ocr_platform_from_record(row) not in SUPPORTED_OCR_PLATFORMS
+    ]
+    union_rows.extend(unknown_legacy_rows)
+    union_dedup, _ = _merge_ocr_master_records([], union_rows)
+    if union_dedup or legacy_path.exists():
+        legacy_path.write_bytes(build_csv_bytes(union_dedup, column_preset="standard_v1", custom_columns=""))
+
+    return {
+        "user_id": safe_user_id,
+        "platform_removed": platform_removed,
+        "platform_totals": platform_totals,
+        "legacy_total": len(union_dedup),
+        "unknown_legacy_rows": len(unknown_legacy_rows),
+        "changed": bool(
+            sum(int(v or 0) for v in platform_removed.values())
+            or (legacy_path.exists() and len(legacy_rows) != len(union_dedup))
+        ),
+    }
 
 
 def get_latest_suspicious_profile_result_for_user(
