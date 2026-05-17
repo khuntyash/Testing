@@ -1,0 +1,12 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.12
+pymupdf>=1.24.0
+pdfplumber>=0.11.0
+pytesseract>=0.3.10
+openpyxl>=3.1.0
+Pillow>=10.0.0
+redis>=4.6.0,<5.0.0
+psycopg[binary]>=3.2.0
+boto3>=1.35.0
+requests>=2.32.0

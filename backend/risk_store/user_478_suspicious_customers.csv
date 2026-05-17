@@ -1,0 +1,2 @@
+customer_key,Name,Pincode,risk_score,risk_flag,hit_count,risky_orders_count,risky_suborders,last_return_type,last_status,last_reason,last_detailed_reason,first_seen_at,last_seen_at,updated_at
+shahinshah|393001,Shahin Shah,393001,37.00,HIGH,2,1,259254354380127616_1,RTO,Completed,Quality issue,Damaged packaging,2026-05-03T09:12:33.784024+00:00,2026-05-03T09:12:33.995417+00:00,2026-05-03T09:12:33.995417+00:00

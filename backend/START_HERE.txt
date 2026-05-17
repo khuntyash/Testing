@@ -1,0 +1,15 @@
+Meesho cropping uses your PyMuPDF scripts via FastAPI. Per-delivery-partner label sizes live in one place: partner_crop.py (PARTNER_LABEL_RECTS and MAX_PROBE_RECT). Edit that file to tune crops for Shadowfax / ValmoPlus / Valmo / Delhivery / Unknown.
+
+1) Install Python deps (once):
+   cd backend
+   pip install -r requirements.txt
+
+2) Start the API (leave running while you use the site):
+   python -m uvicorn server:app --reload --port 8000
+
+3) Start the React app from repo root:
+   npm run dev
+
+Vite proxies /api to port 8000. Only /meesho calls /api/crop/meesho; /flipkart merges PDFs in the browser only.
+
+Production: set VITE_API_URL to your deployed API origin and run uvicorn (or gunicorn) on a public host.

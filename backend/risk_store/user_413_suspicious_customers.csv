@@ -1,0 +1,2 @@
+customer_key,Name,Pincode,risk_score,risk_flag,hit_count,risky_orders_count,risky_suborders,last_return_type,last_status,last_reason,last_detailed_reason,first_seen_at,last_seen_at,updated_at
+ranjanakaushal|140301,RANJANA KAUSHAL,140301,37.00,HIGH,2,1,270504215623906368_1,RTO,Completed,Quality issue,Damaged packaging,2026-04-30T11:59:49.069008+00:00,2026-04-30T11:59:49.310198+00:00,2026-04-30T11:59:49.310198+00:00

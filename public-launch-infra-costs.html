@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Public Launch Hardware and Cost Estimate</title>
+    <style>
+      :root {
+        --bg: #0f172a;
+        --panel: #111827;
+        --panel-2: #1f2937;
+        --text: #e5e7eb;
+        --muted: #9ca3af;
+        --border: #374151;
+        --ok: #10b981;
+        --warn: #f59e0b;
+      }
+      body {
+        margin: 0;
+        font-family: Inter, Segoe UI, Arial, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+      }
+      .wrap {
+        max-width: 1200px;
+        margin: 24px auto;
+        padding: 0 16px 40px;
+      }
+      h1, h2, h3 { margin: 0 0 12px; }
+      p { color: var(--muted); margin: 0 0 14px; line-height: 1.5; }
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 16px;
+        margin-bottom: 16px;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 10px;
+      }
+      .stat {
+        background: var(--panel-2);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 12px;
+      }
+      .label { color: var(--muted); font-size: 12px; }
+      .value { font-size: 20px; font-weight: 700; margin-top: 4px; }
+      .ok { color: var(--ok); }
+      .warn { color: var(--warn); }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 14px;
+      }
+      th, td {
+        border: 1px solid var(--border);
+        padding: 10px;
+        text-align: left;
+        vertical-align: top;
+      }
+      th { background: #0b1220; }
+      .note {
+        border-left: 4px solid var(--warn);
+        padding: 10px 12px;
+        background: #1b2436;
+        color: var(--text);
+      }
+      @media (max-width: 900px) {
+        .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="card">
+        <h1>Public Launch Hardware and Cost Estimate</h1>
+        <p>Goal: support thousands of users by scaling queue workers, API replicas, and durable data services.</p>
+        <div class="grid">
+          <div class="stat"><div class="label">Real PDF dataset</div><div class="value">519 files</div></div>
+          <div class="stat"><div class="label">Peak tested concurrency</div><div class="value">30 clients</div></div>
+          <div class="stat"><div class="label">Measured success</div><div class="value ok">100%</div></div>
+          <div class="stat"><div class="label">Current throughput</div><div class="value warn">~17 jobs/min</div></div>
+        </div>
+      </div>
+
+      <div class="card note">
+        Monthly cloud costs vary by region, commitment plans, and storage/network usage. Treat these as planning ranges.
+      </div>
+
+      <div class="card">
+        <h2>Cloud Cost Tiers (Monthly Opex)</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Tier</th>
+              <th>Target capacity</th>
+              <th>Recommended shape</th>
+              <th>Estimated monthly USD</th>
+              <th>Estimated monthly INR</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Good (pilot production)</td>
+              <td>40-80 heavy jobs/min</td>
+              <td>API 3x (8vCPU), Workers 6x (24vCPU), PG HA 2x, Redis 3x</td>
+              <td>$7,000 - $12,000</td>
+              <td>Rs 5.8L - Rs 10.0L</td>
+            </tr>
+            <tr>
+              <td>Strong (recommended)</td>
+              <td>100-220 heavy jobs/min</td>
+              <td>API 4-6x (16vCPU), Workers 12x (32vCPU), PG 3-node, Redis 3-6x</td>
+              <td>$18,000 - $32,000</td>
+              <td>Rs 14.9L - Rs 26.6L</td>
+            </tr>
+            <tr>
+              <td>Enterprise</td>
+              <td>300+ heavy jobs/min</td>
+              <td>API 8-12x, Workers 20-40x (32-48vCPU), PG HA+, Redis sharded</td>
+              <td>$45,000 - $95,000</td>
+              <td>Rs 37.4L - Rs 78.9L</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>On-Prem Purchase Plan (CapEx)</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Tier</th>
+              <th>Cluster shape</th>
+              <th>One-time hardware USD</th>
+              <th>One-time hardware INR</th>
+              <th>Monthly ops (power/network/staff)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Good</td>
+              <td>11 servers total: API 3, Worker 6, DB 2 (+Redis sidecars)</td>
+              <td>$90,000 - $160,000</td>
+              <td>Rs 74.7L - Rs 132.8L</td>
+              <td>$2,000 - $5,000</td>
+            </tr>
+            <tr>
+              <td>Strong</td>
+              <td>21 servers total: API 6, Worker 12, DB 3 + dedicated Redis</td>
+              <td>$220,000 - $420,000</td>
+              <td>Rs 182.6L - Rs 348.6L</td>
+              <td>$5,000 - $12,000</td>
+            </tr>
+            <tr>
+              <td>Enterprise</td>
+              <td>40+ servers with HA across racks/zones and spare capacity</td>
+              <td>$600,000 - $1,400,000</td>
+              <td>Rs 498.0L - Rs 1162.0L</td>
+              <td>$15,000 - $40,000</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </body>
+</html>

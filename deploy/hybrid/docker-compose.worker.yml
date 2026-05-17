@@ -1,0 +1,22 @@
+services:
+  worker:
+    build:
+      context: ../..
+      dockerfile: backend/Dockerfile
+    command: ["python", "worker.py"]
+    env_file:
+      - ../../.env.production
+    environment:
+      API_PLATFORM: vps
+      DISABLE_EMBEDDED_WORKER: "1"
+      DB_BACKEND: postgres
+      QUEUE_BACKEND: redis
+      STORAGE_BACKEND: s3
+    # Use reliable public resolvers so the worker doesn't crash on transient
+    # systemd-resolved hiccups when reaching managed services like Railway
+    # Redis or Cloudflare R2.
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+      - 9.9.9.9
+    restart: unless-stopped

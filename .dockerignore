@@ -1,0 +1,12 @@
+.git
+.gitignore
+node_modules
+dist
+backend/__pycache__
+backend/temp
+*.log
+*.sqlite
+*.db-journal
+*.db-wal
+*.db-shm
+.cursor

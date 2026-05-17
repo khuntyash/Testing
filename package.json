@@ -1,0 +1,24 @@
+{
+  "name": "cropper-hub",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "format": "prettier --write \"src/**/*.{js,jsx}\" \"index.html\" \"vite.config.js\""
+  },
+  "dependencies": {
+    "firebase": "^12.12.1",
+    "pdf-lib": "^1.17.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^7.14.2"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "prettier": "^3.4.2",
+    "vite": "^5.4.11"
+  }
+}

@@ -1,0 +1,4 @@
+Order_id,Name,Address_1,Address_2,Address_3,District,State,Pincode,Sku,Size,Quantity,Payment_Mode,Courier_Partner,Courier_trans_id
+436652983093810100,Cust 0,Addr 1,,,Dist,State,560000,SKU-X,,1,COD,E-Kart Logistics,FMPCABCD
+336600800077540101,Cust 1,Addr 1,,,Dist,State,560001,SKU-X,,1,COD,E-Kart Logistics,FMPCABCD
+437378187103426400,Cust 2,Addr 1,,,Dist,State,560002,SKU-X,,1,COD,E-Kart Logistics,FMPCABCD

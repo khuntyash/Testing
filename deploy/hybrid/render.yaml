@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: cropperhub-api
+    env: docker
+    dockerfilePath: backend/Dockerfile
+    dockerContext: .
+    autoDeploy: true
+    healthCheckPath: /api/ready
+    envVars:
+      - key: API_PLATFORM
+        value: render
+      - key: DISABLE_EMBEDDED_WORKER
+        value: "1"
+      - key: DB_BACKEND
+        value: postgres
+      - key: QUEUE_BACKEND
+        value: redis
+      - key: STORAGE_BACKEND
+        value: s3
