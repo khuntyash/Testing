@@ -1,0 +1,58 @@
+services:
+  worker-realtime:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    env_file:
+      - ./.env.production
+      - ./deploy/hybrid/env/worker.common.env
+      - ./deploy/hybrid/env/worker.cpu-pinning.env
+      - ./deploy/hybrid/env/worker.realtime.env
+    environment:
+      WORKER_HOST_ROLE: realtime
+      WORKER_TEMP_DIR: ${WORKER_REALTIME_NVME_TEMP_DIR:-/mnt/nvme0n1/tmp/cropperhub/realtime}
+    cpuset: "${WORKER_REALTIME_CPUSET:-0-3}"
+    mem_limit: "${WORKER_REALTIME_MEM_LIMIT:-6g}"
+    tmpfs:
+      - /dev/shm:size=3221225472,exec,nosuid,nodev,mode=1777
+    healthcheck:
+      test: ["CMD", "python", "worker_healthcheck.py", "--role", "realtime"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 40s
+    stop_grace_period: 90s
+    restart: unless-stopped
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+      - 9.9.9.9
+
+  worker-bulk:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    env_file:
+      - ./.env.production
+      - ./deploy/hybrid/env/worker.common.env
+      - ./deploy/hybrid/env/worker.cpu-pinning.env
+      - ./deploy/hybrid/env/worker.bulk.env
+    environment:
+      WORKER_HOST_ROLE: bulk
+      WORKER_TEMP_DIR: ${WORKER_BULK_NVME_TEMP_DIR:-/mnt/nvme0n1/tmp/cropperhub/bulk}
+    cpuset: "${WORKER_BULK_CPUSET:-4-15}"
+    mem_limit: "${WORKER_BULK_MEM_LIMIT:-14g}"
+    tmpfs:
+      - /dev/shm:size=6442450944,exec,nosuid,nodev,mode=1777
+    healthcheck:
+      test: ["CMD", "python", "worker_healthcheck.py", "--role", "bulk"]
+      interval: 45s
+      timeout: 8s
+      retries: 3
+      start_period: 60s
+    stop_grace_period: 300s
+    restart: unless-stopped
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+      - 9.9.9.9
